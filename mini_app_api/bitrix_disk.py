@@ -1,9 +1,11 @@
 """
 Bitrix24 Disk storage — same interface shape as drive.py's DriveManager
 (get_or_create_client_folder / get_or_create_folder / upload_bytes) so
-documents.py can use either with minimal changes. Files land in the
-company's common Disk storage (ENTITY_TYPE=common), same folder layout
-as the Google Drive version: "{full_name} | {phone}" -> subfolders.
+documents.py can use either with minimal changes. Files land inside the
+"CLIENTS" folder that already exists at the root of "Загальний диск"
+(the company's common Disk storage, ENTITY_TYPE=common) — not the storage
+root itself. Same folder layout as the Google Drive version below that:
+"{full_name} | {phone}" -> subfolders.
 
 API reference: https://apidocs.bitrix24.com/api-reference/disk/
 - disk.storage.getlist (filter ENTITY_TYPE=common) -> storage ID + root folder object ID
@@ -17,6 +19,8 @@ from __future__ import annotations
 import base64
 
 from . import bitrix
+
+CLIENTS_FOLDER_NAME = "CLIENTS"
 
 SUBFOLDERS = {
     "credit": "Кредитні договори",
@@ -38,18 +42,24 @@ def _sanitize_name(name: str) -> str:
 class BitrixDiskManager:
     def __init__(self):
         self._storage_id = None
-        self._root_folder_id = None
+        self._clients_folder_id = None
 
-    def _ensure_storage(self):
-        if self._storage_id is not None:
+    def _ensure_clients_folder(self):
+        if self._clients_folder_id is not None:
             return
         result = bitrix._post("disk.storage.getlist", {"filter": {"ENTITY_TYPE": "common"}})
         storages = result["result"]
         if not storages:
             raise RuntimeError("Bitrix24: no common Disk storage found (disk.storage.getlist)")
-        storage = storages[0]
-        self._storage_id = storage["ID"]
-        self._root_folder_id = storage["ROOT_OBJECT_ID"]
+        self._storage_id = storages[0]["ID"]
+
+        clients = self._find_child_by_name(self._storage_id, CLIENTS_FOLDER_NAME, at_storage_root=True)
+        if not clients:
+            raise RuntimeError(
+                f"Bitrix24: '{CLIENTS_FOLDER_NAME}' folder not found at the root of Загальний диск — "
+                "create it once in the Bitrix24 UI (Диск -> Загальний диск)."
+            )
+        self._clients_folder_id = clients["ID"]
 
     def _find_child_by_name(self, parent_id, name: str, *, at_storage_root: bool = False):
         method = "disk.storage.getchildren" if at_storage_root else "disk.folder.getchildren"
@@ -60,12 +70,12 @@ class BitrixDiskManager:
         return None
 
     def get_or_create_client_folder(self, full_name: str, phone: str) -> dict:
-        self._ensure_storage()
+        self._ensure_clients_folder()
         name = f"{_sanitize_name(full_name)} | {phone}"
-        existing = self._find_child_by_name(self._storage_id, name, at_storage_root=True)
+        existing = self._find_child_by_name(self._clients_folder_id, name)
         if existing:
             return {"id": existing["ID"], "webViewLink": existing.get("DETAIL_URL")}
-        result = bitrix._post("disk.folder.addsubfolder", {"id": self._root_folder_id, "data": {"NAME": name}})
+        result = bitrix._post("disk.folder.addsubfolder", {"id": self._clients_folder_id, "data": {"NAME": name}})
         created = result["result"]
         return {"id": created["ID"], "webViewLink": created.get("DETAIL_URL")}
 
