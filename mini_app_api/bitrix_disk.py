@@ -2,10 +2,13 @@
 Bitrix24 Disk storage — same interface shape as drive.py's DriveManager
 (get_or_create_client_folder / get_or_create_folder / upload_bytes) so
 documents.py can use either with minimal changes. Files land inside the
-"CLIENTS" folder that already exists at the root of "Загальний диск"
-(the company's common Disk storage, ENTITY_TYPE=common) — not the storage
-root itself. Same folder layout as the Google Drive version below that:
-"{full_name} | {phone}" -> subfolders.
+"CLIENTS" folder that already exists at the root of "Company Drive" (the
+"Загальний диск" visible in the UI at /docs/shared/... — confirmed live via
+disk.storage.getlist on 2026-07-11: there are *three* ENTITY_TYPE=common
+storages on this portal — "Top Management's documents", "Sales and
+marketing", and this one, ENTITY_ID="shared_files_s1" — so it must be
+targeted by ENTITY_ID, not just ENTITY_TYPE=common). Same folder layout as
+the Google Drive version below that: "{full_name} | {phone}" -> subfolders.
 
 API reference: https://apidocs.bitrix24.com/api-reference/disk/
 - disk.storage.getlist (filter ENTITY_TYPE=common) -> storage ID + root folder object ID
@@ -19,6 +22,9 @@ from __future__ import annotations
 import base64
 
 from . import bitrix
+
+# "Company Drive" storage, confirmed via a live disk.storage.getlist call.
+COMPANY_DRIVE_ENTITY_ID = "shared_files_s1"
 
 CLIENTS_FOLDER_NAME = "CLIENTS"
 
@@ -47,16 +53,22 @@ class BitrixDiskManager:
     def _ensure_clients_folder(self):
         if self._clients_folder_id is not None:
             return
-        result = bitrix._post("disk.storage.getlist", {"filter": {"ENTITY_TYPE": "common"}})
+        result = bitrix._post(
+            "disk.storage.getlist",
+            {"filter": {"ENTITY_TYPE": "common", "ENTITY_ID": COMPANY_DRIVE_ENTITY_ID}},
+        )
         storages = result["result"]
         if not storages:
-            raise RuntimeError("Bitrix24: no common Disk storage found (disk.storage.getlist)")
+            raise RuntimeError(
+                f"Bitrix24: Company Drive storage (ENTITY_ID={COMPANY_DRIVE_ENTITY_ID!r}) not found "
+                "(disk.storage.getlist) — did the storage get renamed/removed?"
+            )
         self._storage_id = storages[0]["ID"]
 
         clients = self._find_child_by_name(self._storage_id, CLIENTS_FOLDER_NAME, at_storage_root=True)
         if not clients:
             raise RuntimeError(
-                f"Bitrix24: '{CLIENTS_FOLDER_NAME}' folder not found at the root of Загальний диск — "
+                f"Bitrix24: '{CLIENTS_FOLDER_NAME}' folder not found at the root of Company Drive — "
                 "create it once in the Bitrix24 UI (Диск -> Загальний диск)."
             )
         self._clients_folder_id = clients["ID"]
