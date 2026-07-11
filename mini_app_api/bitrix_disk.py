@@ -83,7 +83,9 @@ class BitrixDiskManager:
 
     def get_or_create_client_folder(self, full_name: str, phone: str) -> dict:
         self._ensure_clients_folder()
-        name = f"{_sanitize_name(full_name)} | {phone}"
+        # "|" avoided as a separator — some Disk backends reject it in
+        # folder names even though Google Drive tolerates it fine.
+        name = f"{_sanitize_name(full_name)} - {phone}"
         existing = self._find_child_by_name(self._clients_folder_id, name)
         if existing:
             return {"id": existing["ID"], "webViewLink": existing.get("DETAIL_URL")}

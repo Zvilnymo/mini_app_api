@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 
@@ -38,8 +39,20 @@ def _post(method: str, payload: dict, timeout: int = 15) -> dict:
     url = BITRIX_WEBHOOK.rstrip("/") + "/" + method
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # Bitrix puts the actual error/error_description in the response
+        # body even on 4xx/5xx — urlopen only gives us the bare status
+        # unless we read the body off the error object ourselves.
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+            detail = parsed.get("error_description", parsed.get("error", body))
+        except json.JSONDecodeError:
+            detail = body
+        raise RuntimeError(f"Bitrix24 {method} HTTP {e.code}: {detail}") from e
     if "error" in result:
         raise RuntimeError(f"Bitrix24 {method} error: {result.get('error_description', result['error'])}")
     return result
