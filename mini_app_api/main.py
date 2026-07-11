@@ -132,11 +132,16 @@ def get_me(authorization: Optional[str] = Header(default=None)):
         docs_total = len(checklist)
         docs_ready = sum(1 for d in checklist if d["latest_status"] in ("accepted", "pending"))
 
+        # Prefer the CRM's full name over whatever Telegram display name was
+        # stored at registration time — the CRM name is the client's real
+        # legal name, Telegram's first/last name can be a nickname.
+        full_name = ctx.contact["full_name"] if ctx and ctx.contact and ctx.contact.get("full_name") else client["full_name"]
+
         return {
             "registered": True,
             "client": {
                 "id": client["id"],
-                "full_name": client["full_name"],
+                "full_name": full_name,
                 "phone": client["phone"],
             },
             "case": case,
@@ -179,7 +184,15 @@ def register(phone: str = Form(...), authorization: Optional[str] = Header(defau
     user = authenticate(authorization)
     conn = db.get_connection()
     try:
-        full_name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or user.get("username") or "Client"
+        # Prefer the CRM's name for the entered phone over the Telegram
+        # display name — falls back to Telegram name if there's no CRM
+        # contact yet (e.g. brand-new lead not synced by etl_zv yet).
+        crm_contact = db.get_contact_by_phone(conn, db.normalize_phone(phone))
+        full_name = (
+            crm_contact["full_name"]
+            if crm_contact and crm_contact.get("full_name")
+            else " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or user.get("username") or "Client"
+        )
         client = db.create_client(conn, user["id"], full_name, phone)
         return {"registered": True, "client": {"id": client["id"], "full_name": client["full_name"], "phone": client["phone"]}}
     finally:

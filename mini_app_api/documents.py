@@ -83,7 +83,10 @@ def upload_document(conn, client: dict, document_type: str, filename: str, conte
 
     subfolder = drive.get_or_create_folder(SUBFOLDERS[meta["folder"]], folder_id)
 
-    validation_status = None
+    # Default to "pending" (uploaded, no AI verdict yet) rather than leaving
+    # this null — null renders no status badge at all, which reads as "the
+    # upload silently did nothing" even though the file made it to Drive.
+    validation_status = "pending"
     if not meta.get("skip_ai_validation"):
         suffix = os.path.splitext(filename)[1] or ""
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
