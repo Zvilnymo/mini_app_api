@@ -14,7 +14,22 @@ import os
 import urllib.request
 from datetime import datetime, timedelta
 
-BITRIX_WEBHOOK = os.getenv("BITRIX_WEBHOOK")
+def _resolve_webhook() -> str:
+    # Same fallback documents_bot's telegram_bot.py uses: a single
+    # BITRIX_WEBHOOK env var takes priority if set, otherwise build it from
+    # the three B24_* parts (how it's actually configured on Render here).
+    direct = os.getenv("BITRIX_WEBHOOK")
+    if direct:
+        return direct
+    domain = os.getenv("B24_DOMAIN", "")
+    user_id = os.getenv("B24_USER_ID", "")
+    token = os.getenv("B24_TOKEN_DEALS", "")
+    if domain and user_id and token:
+        return f"https://{domain}/rest/{user_id}/{token}/"
+    return ""
+
+
+BITRIX_WEBHOOK = _resolve_webhook()
 
 
 def _post(method: str, payload: dict, timeout: int = 15) -> dict:
