@@ -1,8 +1,14 @@
 """
 Document checklist + upload, mirroring telegram_bot.py's DOCUMENT_TYPES and
-upload flow (Drive folder structure + docbot.documents rows), reusing
-ai_document_validator.py as-is (it's a clean, side-effect-free module —
-unlike telegram_bot.py, safe to import directly).
+upload flow (docbot.documents rows), reusing ai_document_validator.py as-is
+(it's a clean, side-effect-free module — unlike telegram_bot.py, safe to
+import directly).
+
+Files are stored in Bitrix24 Disk (company common storage), not Google
+Drive — documents_bot's own Drive uploads are a separate, unrelated
+destination; docbot.clients.drive_folder_id/drive_folder_url stay
+Google-only and are never read or written here, to avoid mixing up a
+Google Drive folder ID with a Bitrix Disk one.
 """
 from __future__ import annotations
 
@@ -13,7 +19,7 @@ import tempfile
 from ai_document_validator import validator as ai_validator
 
 from . import db
-from .drive import DriveManager, SUBFOLDERS
+from .bitrix_disk import BitrixDiskManager, SUBFOLDERS
 
 # Copied from telegram_bot.py DOCUMENT_TYPES — keep in sync if the bot's
 # checklist changes. 'is_text'/'is_text_email' types (ecpass, emailpass) are
@@ -37,14 +43,14 @@ DOCUMENT_TYPES = {
 
 UPLOADABLE_TYPES = {k: v for k, v in DOCUMENT_TYPES.items() if not v.get("is_text") and not v.get("is_text_email")}
 
-_drive = None
+_disk = None
 
 
-def get_drive() -> DriveManager:
-    global _drive
-    if _drive is None:
-        _drive = DriveManager()
-    return _drive
+def get_disk() -> BitrixDiskManager:
+    global _disk
+    if _disk is None:
+        _disk = BitrixDiskManager()
+    return _disk
 
 
 def checklist_for_client(conn, client_id: int | None) -> list[dict]:
@@ -73,15 +79,13 @@ def upload_document(conn, client: dict, document_type: str, filename: str, conte
         raise ValueError(f"unknown or non-uploadable document_type: {document_type}")
 
     meta = DOCUMENT_TYPES[document_type]
-    drive = get_drive()
+    disk = get_disk()
 
-    folder_id = client.get("drive_folder_id")
-    if not folder_id:
-        client_folder = drive.get_or_create_client_folder(client["full_name"], client["phone"])
-        db.update_client_drive_folder(conn, client["id"], client_folder["id"], client_folder.get("webViewLink"))
-        folder_id = client_folder["id"]
-
-    subfolder = drive.get_or_create_folder(SUBFOLDERS[meta["folder"]], folder_id)
+    # Not cached on docbot.clients (that's documents_bot's Google Drive
+    # folder id, a different system) — get_or_create_client_folder is
+    # idempotent, so resolving it fresh each upload is simple and correct.
+    client_folder = disk.get_or_create_client_folder(client["full_name"], client["phone"])
+    subfolder = disk.get_or_create_folder(SUBFOLDERS[meta["folder"]], client_folder["id"])
 
     # Default to "pending" (uploaded, no AI verdict yet) rather than leaving
     # this null — null renders no status badge at all, which reads as "the
@@ -100,7 +104,7 @@ def upload_document(conn, client: dict, document_type: str, filename: str, conte
             validation_status = result.status
 
     mimetype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    uploaded = drive.upload_bytes(content, filename, subfolder["id"], mimetype)
+    uploaded = disk.upload_bytes(content, filename, subfolder["id"], mimetype)
 
     row = db.add_document(
         conn,

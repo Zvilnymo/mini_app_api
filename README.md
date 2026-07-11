@@ -8,25 +8,27 @@ duplicating it:
 - Same Postgres database (`DATABASE_URL`) — reads `crm.*` (etl_zv warehouse:
   case stage, payments, debt overview) and `docbot.*` (documents_bot's own
   tables: clients, documents).
-- Same Google Drive credentials — uploads land in the same client folders
-  documents_bot already creates.
 - `ai_document_validator.py` and `prompts.py` are copied from `documents_bot`
   (not imported across repos) — keep them in sync by hand if the validation
   prompts change there.
-- `BITRIX_WEBHOOK` is used for exactly one write path with no warehouse
-  equivalent: creating a Bitrix24 task when a client submits a complaint
-  (`POST /api/complaints`). That webhook needs `tasks.task.add` permission.
+- `BITRIX_WEBHOOK` is used for two write paths with no warehouse equivalent:
+  - `POST /api/complaints` — creates a Bitrix24 task assigned to the case's
+    manager. Needs `tasks.task.add` permission.
+  - `POST /api/documents/upload` — uploads the file into Bitrix24 Disk
+    (company common storage, see `bitrix_disk.py`), same folder layout
+    (`{full name} | {phone}` -> subfolders) documents_bot uses on Google
+    Drive, but this is a **separate, unrelated destination** — nothing here
+    touches documents_bot's Google Drive folders. Needs `disk` (folder read/
+    write/upload) permission on the webhook.
 
 ## Env vars
 
 - `DATABASE_URL` — same Postgres as documents_bot
 - `TELEGRAM_BOT_TOKEN` — same bot that hosts documents_bot (validates the
   Mini App's initData)
-- `GOOGLE_OAUTH_TOKEN` or `GOOGLE_CREDENTIALS_BASE64` or
-  `GOOGLE_CREDENTIALS_FILE` + `ROOT_FOLDER_ID` — same as documents_bot
 - `OPENAI_API_KEY` — used by ai_document_validator.py
 - `BITRIX_WEBHOOK` — same webhook documents_bot uses, must allow
-  `tasks.task.add`
+  `tasks.task.add` and `disk.*` (folder/file read+write)
 - `CORS_ORIGIN` — the mini_app Static Site's URL
 
 ## Local dev

@@ -17,13 +17,13 @@ from datetime import datetime, timedelta
 BITRIX_WEBHOOK = os.getenv("BITRIX_WEBHOOK")
 
 
-def _post(method: str, payload: dict) -> dict:
+def _post(method: str, payload: dict, timeout: int = 15) -> dict:
     if not BITRIX_WEBHOOK:
         raise RuntimeError("BITRIX_WEBHOOK is not configured")
     url = BITRIX_WEBHOOK.rstrip("/") + "/" + method
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read().decode("utf-8"))
     if "error" in result:
         raise RuntimeError(f"Bitrix24 {method} error: {result.get('error_description', result['error'])}")

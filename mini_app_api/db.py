@@ -96,15 +96,6 @@ def create_client(conn, telegram_id: int, full_name: str, phone: str):
         return cur.fetchone()
 
 
-def update_client_drive_folder(conn, client_id: int, folder_id: str, folder_url: str):
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE docbot.clients SET drive_folder_id = %s, drive_folder_url = %s WHERE id = %s",
-            (folder_id, folder_url, client_id),
-        )
-        conn.commit()
-
-
 def get_documents_by_client(conn, client_id: int):
     with conn.cursor() as cur:
         cur.execute(
