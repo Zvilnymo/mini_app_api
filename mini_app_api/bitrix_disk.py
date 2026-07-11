@@ -120,3 +120,22 @@ class BitrixDiskManager:
             "webViewLink": uploaded.get("DETAIL_URL"),
             "size": uploaded.get("SIZE", len(data)),
         }
+
+    def update_file(self, file_id, filename: str, data: bytes) -> dict:
+        """Overwrite an existing Disk file in place (new version, same file
+        ID) instead of creating a sibling copy — used for ecpass/emailpass
+        where re-saving should replace the previous answer, not pile up
+        "Пароль (1).txt", "(2).txt", ..."""
+        encoded = base64.b64encode(data).decode("ascii")
+        result = bitrix._post(
+            "disk.file.uploadversion",
+            {"id": file_id, "fileContent": [filename, encoded]},
+            timeout=60,
+        )
+        uploaded = result["result"]
+        return {
+            "id": uploaded["ID"],
+            "name": uploaded.get("NAME", filename),
+            "webViewLink": uploaded.get("DETAIL_URL"),
+            "size": uploaded.get("SIZE", len(data)),
+        }

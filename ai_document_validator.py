@@ -300,7 +300,12 @@ class AIDocumentValidator:
                 ],
                 max_tokens=1000,
                 temperature=0.1,
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
+                # Without an explicit timeout the SDK default is several
+                # minutes — long enough that Render's/Cloudflare's proxy cuts
+                # the client's connection first, surfacing as a bare "Failed
+                # to fetch" with nothing useful in our own logs.
+                timeout=30,
             )
 
             content = response.choices[0].message.content or ""
@@ -325,7 +330,7 @@ class AIDocumentValidator:
             return self._pdf_file_id_cache[key]
 
         with open(pdf_path, "rb") as f:
-            up = _responses_client.files.create(file=f, purpose="user_data")
+            up = _responses_client.files.create(file=f, purpose="user_data", timeout=30)
 
         self._pdf_file_id_cache[key] = up.id
         logger.info(f"Uploaded PDF to OpenAI Files API: file_id={up.id}, size={size}")
@@ -363,6 +368,7 @@ class AIDocumentValidator:
             ],
             max_output_tokens=1000,
             temperature=0.1,
+            timeout=30,
         )
 
         raw_text = (getattr(resp, "output_text", "") or "").strip()

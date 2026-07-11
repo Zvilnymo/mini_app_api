@@ -2,10 +2,12 @@ import os
 from datetime import date, datetime
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import bitrix, db, documents, stages
+from ai_document_validator import validator as ai_validator
+
+from . import bitrix, db, declaration, documents, stages
 from .telegram_auth import InvalidInitData, validate_init_data
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -38,7 +40,11 @@ def authenticate(authorization: Optional[str] = Header(default=None)) -> dict:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True}
+    # ai_validation_enabled surfaces whether OPENAI_API_KEY actually made it
+    # into this deploy's env — without it, uploads silently skip AI checks
+    # and every file looks "accepted", which is easy to mistake for a broken
+    # validator instead of a missing env var. No secret values are exposed.
+    return {"ok": True, "ai_validation_enabled": ai_validator.enabled}
 
 
 class CaseContext:
@@ -268,6 +274,33 @@ async def upload_document(
                 "drive_file_url": result["document"]["drive_file_url"],
             },
         }
+    finally:
+        conn.close()
+
+
+@app.get("/api/declaration")
+def get_declaration(authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        return {
+            "questions": declaration.QUESTIONS,
+            "answers": declaration.get_answers(conn, client["id"]),
+            "completed": declaration.is_complete(conn, client["id"]),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/declaration")
+def submit_declaration(answers: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        declaration.save_and_submit(conn, client, answers)
+        return {"ok": True}
     finally:
         conn.close()
 

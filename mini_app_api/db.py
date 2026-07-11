@@ -120,6 +120,77 @@ def is_screening_complete(client: dict) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# docbot.declarations — the "Декларація" questionnaire (17 free-text fields),
+# same table documents_bot's own /declaration flow reads and writes.
+# ---------------------------------------------------------------------------
+
+# Whitelist of real docbot.declarations text columns — used to build UPDATE
+# statements safely (column names can't be parameterized, so only ever
+# accept keys from this fixed set, never anything from the request).
+DECLARATION_FIELD_KEYS = (
+    "email_password",
+    "living_address_2022_2025",
+    "registration_change",
+    "property_alienation_self",
+    "property_alienation_family",
+    "family_vehicles",
+    "corporate_rights",
+    "crypto_foreign_credits",
+    "specific_bank_credits",
+    "online_betting",
+    "bank_installments",
+    "creditor_address",
+    "housing_owner",
+    "marriage_transactions",
+    "alienation_documents",
+    "vehicle_power_of_attorney",
+    "alimony_info",
+)
+
+
+def get_or_create_declaration(conn, client_id: int, attempt: int = 1):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM docbot.declarations WHERE client_id = %s AND attempt = %s",
+            (client_id, attempt),
+        )
+        row = cur.fetchone()
+        if row:
+            return row
+        cur.execute(
+            "INSERT INTO docbot.declarations (client_id, attempt) VALUES (%s, %s) RETURNING *",
+            (client_id, attempt),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def save_declaration_answers(conn, client_id: int, answers: dict, attempt: int = 1):
+    fields = {k: v for k, v in answers.items() if k in DECLARATION_FIELD_KEYS}
+    if not fields:
+        return get_or_create_declaration(conn, client_id, attempt)
+    get_or_create_declaration(conn, client_id, attempt)  # ensure the row exists first
+    set_clause = ", ".join(f"{key} = %s" for key in fields)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE docbot.declarations SET {set_clause} WHERE client_id = %s AND attempt = %s RETURNING *",
+            (*fields.values(), client_id, attempt),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def complete_declaration(conn, client_id: int, attempt: int = 1):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE docbot.declarations SET status = 'completed', completed_at = CURRENT_TIMESTAMP "
+            "WHERE client_id = %s AND attempt = %s",
+            (client_id, attempt),
+        )
+        conn.commit()
+
+
 def get_documents_by_client(conn, client_id: int):
     with conn.cursor() as cur:
         cur.execute(
@@ -143,6 +214,41 @@ def add_document(conn, client_id: int, document_type: str, file_name: str,
             """,
             (client_id, document_type, file_name, drive_file_id, drive_file_url,
              file_size, validation_status),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def get_latest_document(conn, client_id: int, document_type: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT * FROM docbot.documents
+            WHERE client_id = %s AND document_type = %s
+            ORDER BY uploaded_at DESC
+            LIMIT 1
+            """,
+            (client_id, document_type),
+        )
+        return cur.fetchone()
+
+
+def update_document_file(conn, document_id: int, *, drive_file_id: str,
+                          drive_file_url: str, file_size: int):
+    """Used for text-type documents (ecpass/emailpass) whose Disk file is
+    overwritten in place — updates the same docbot.documents row rather than
+    inserting a new one, since the underlying Disk file ID doesn't change
+    (disk.file.uploadversion keeps it stable)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE docbot.documents
+            SET drive_file_id = %s, drive_file_url = %s, file_size = %s,
+                uploaded_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+            RETURNING *
+            """,
+            (drive_file_id, drive_file_url, file_size, document_id),
         )
         conn.commit()
         return cur.fetchone()
