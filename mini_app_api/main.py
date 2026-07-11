@@ -139,6 +139,7 @@ def get_me(authorization: Optional[str] = Header(default=None)):
 
         return {
             "registered": True,
+            "screening_completed": db.is_screening_complete(client),
             "client": {
                 "id": client["id"],
                 "full_name": full_name,
@@ -151,6 +152,31 @@ def get_me(authorization: Optional[str] = Header(default=None)):
             "docs_ready": docs_ready,
             "docs_total": docs_total,
         }
+    finally:
+        conn.close()
+
+
+@app.post("/api/screening")
+def submit_screening(
+    has_gambling_crypto: bool = Form(...),
+    is_fraud_victim: bool = Form(...),
+    has_sold_property: bool = Form(...),
+    income_over_30k: bool = Form(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        db.update_client_screening(
+            conn,
+            client["id"],
+            has_gambling_crypto=has_gambling_crypto,
+            is_fraud_victim=is_fraud_victim,
+            has_sold_property=has_sold_property,
+            income_over_30k=income_over_30k,
+        )
+        return {"ok": True}
     finally:
         conn.close()
 
@@ -231,6 +257,35 @@ async def upload_document(
         content = await file.read()
         try:
             result = documents.upload_document(conn, client, document_type, file.filename, content)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {
+            "validation_status": result["validation_status"],
+            "document": {
+                "id": result["document"]["id"],
+                "document_type": result["document"]["document_type"],
+                "file_name": result["document"]["file_name"],
+                "drive_file_url": result["document"]["drive_file_url"],
+            },
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/documents/upload-text")
+def upload_text_document(
+    document_type: str = Form(...),
+    text: str = Form(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        if not text.strip():
+            raise HTTPException(400, "text is empty")
+        try:
+            result = documents.upload_text_document(conn, client, document_type, text.strip())
         except ValueError as e:
             raise HTTPException(400, str(e))
         return {

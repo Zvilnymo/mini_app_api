@@ -96,6 +96,30 @@ def create_client(conn, telegram_id: int, full_name: str, phone: str):
         return cur.fetchone()
 
 
+def update_client_screening(conn, client_id: int, *, has_gambling_crypto: bool, is_fraud_victim: bool,
+                             has_sold_property: bool, income_over_30k: bool):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE docbot.clients
+            SET has_gambling_crypto = %s, is_fraud_victim = %s,
+                has_sold_property = %s, income_over_30k = %s
+            WHERE id = %s
+            RETURNING *
+            """,
+            (has_gambling_crypto, is_fraud_victim, has_sold_property, income_over_30k, client_id),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def is_screening_complete(client: dict) -> bool:
+    return all(
+        client.get(key) is not None
+        for key in ("has_gambling_crypto", "is_fraud_victim", "has_sold_property", "income_over_30k")
+    )
+
+
 def get_documents_by_client(conn, client_id: int):
     with conn.cursor() as cur:
         cur.execute(

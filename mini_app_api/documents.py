@@ -42,6 +42,7 @@ DOCUMENT_TYPES = {
 }
 
 UPLOADABLE_TYPES = {k: v for k, v in DOCUMENT_TYPES.items() if not v.get("is_text") and not v.get("is_text_email")}
+TEXT_TYPES = {k: v for k, v in DOCUMENT_TYPES.items() if v.get("is_text") or v.get("is_text_email")}
 
 _disk = None
 
@@ -68,10 +69,19 @@ def checklist_for_client(conn, client_id: int | None) -> list[dict]:
             "emoji": meta["emoji"],
             "required": meta["required"],
             "uploadable": doc_type in UPLOADABLE_TYPES,
+            "text_input": doc_type in TEXT_TYPES,
             "uploaded_count": len(docs),
             "latest_status": docs[0]["validation_status"] if docs else None,
         })
     return items
+
+
+def _resolve_subfolder(disk: BitrixDiskManager, client: dict, folder_key: str) -> dict:
+    # Not cached on docbot.clients (that's documents_bot's Google Drive
+    # folder id, a different system) — get_or_create_client_folder is
+    # idempotent, so resolving it fresh each upload is simple and correct.
+    client_folder = disk.get_or_create_client_folder(client["full_name"], client["phone"])
+    return disk.get_or_create_folder(SUBFOLDERS[folder_key], client_folder["id"])
 
 
 def upload_document(conn, client: dict, document_type: str, filename: str, content: bytes) -> dict:
@@ -80,12 +90,7 @@ def upload_document(conn, client: dict, document_type: str, filename: str, conte
 
     meta = DOCUMENT_TYPES[document_type]
     disk = get_disk()
-
-    # Not cached on docbot.clients (that's documents_bot's Google Drive
-    # folder id, a different system) — get_or_create_client_folder is
-    # idempotent, so resolving it fresh each upload is simple and correct.
-    client_folder = disk.get_or_create_client_folder(client["full_name"], client["phone"])
-    subfolder = disk.get_or_create_folder(SUBFOLDERS[meta["folder"]], client_folder["id"])
+    subfolder = _resolve_subfolder(disk, client, meta["folder"])
 
     # Default to "pending" (uploaded, no AI verdict yet) rather than leaving
     # this null — null renders no status badge at all, which reads as "the
@@ -120,3 +125,31 @@ def upload_document(conn, client: dict, document_type: str, filename: str, conte
         "document": row,
         "validation_status": validation_status,
     }
+
+
+def upload_text_document(conn, client: dict, document_type: str, text: str) -> dict:
+    """ecpass ("Пароль від ЕЦП") / emailpass ("Пошта та пароль") — no file,
+    just short text the client types in, saved as a .txt on Disk. No AI
+    validation applies to these (nothing to visually verify)."""
+    if document_type not in TEXT_TYPES:
+        raise ValueError(f"unknown or non-text document_type: {document_type}")
+
+    meta = TEXT_TYPES[document_type]
+    disk = get_disk()
+    subfolder = _resolve_subfolder(disk, client, meta["folder"])
+
+    filename = f"{meta['name']}.txt"
+    content = text.encode("utf-8")
+    uploaded = disk.upload_bytes(content, filename, subfolder["id"], "text/plain")
+
+    row = db.add_document(
+        conn,
+        client_id=client["id"],
+        document_type=document_type,
+        file_name=filename,
+        drive_file_id=uploaded["id"],
+        drive_file_url=uploaded.get("webViewLink"),
+        file_size=int(uploaded.get("size", len(content))),
+        validation_status="pending",
+    )
+    return {"document": row, "validation_status": "pending"}
