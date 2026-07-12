@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ai_document_validator import validator as ai_validator
 
-from . import bitrix, db, declaration, documents, stages
+from . import bitrix, complaints, db, declaration, documents, stages
 from .telegram_auth import InvalidInitData, validate_init_data
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -202,24 +202,45 @@ def submit_screening(
         conn.close()
 
 
+@app.get("/api/complaints/departments")
+def list_departments(authorization: Optional[str] = Header(default=None)):
+    authenticate(authorization)
+    return {"departments": [{"key": key, "name": d["name"]} for key, d in complaints.DEPARTMENTS.items()]}
+
+
 @app.post("/api/complaints")
-def create_complaint(text: str = Form(...), authorization: Optional[str] = Header(default=None)):
+def create_complaint(
+    department: str = Form(...),
+    employee_name: str = Form(...),
+    text: str = Form(...),
+    authorization: Optional[str] = Header(default=None),
+):
     user = authenticate(authorization)
+    dept = complaints.DEPARTMENTS.get(department)
+    if not dept:
+        raise HTTPException(400, f"unknown department: {department}")
+    if not dept["responsible_id"]:
+        raise HTTPException(500, f"server misconfigured: no responsible_id set for department {department}")
+
     conn = db.get_connection()
     try:
         client = _require_client(conn, user)
         ctx = _load_case_context(conn, client["phone"])
-        if not ctx or not ctx.manager_id:
-            raise HTTPException(
-                422,
-                "Не вдалося визначити відповідального менеджера для вашої справи. "
-                "Зверніться, будь ласка, через чат.",
-            )
+        description = (
+            f"📌 Суть скарги:\n{text}\n\n"
+            f"👤 Співробітник: {employee_name}\n"
+            f"🙍‍♂️ Клієнт: {client['full_name']}\n"
+            f"📬 Зв'язок: {client['phone']}"
+        )
+        # Don't list the department head twice — once as RESPONSIBLE_ID and
+        # again in AUDITORS — for departments where they're the same person.
+        auditors = [uid for uid in complaints.ALWAYS_CC_IDS if uid != dept["responsible_id"]]
         task_id = bitrix.create_complaint_task(
-            title=f"Скарга від клієнта {client['full_name']} ({client['phone']})",
-            description=text,
-            responsible_id=ctx.manager_id,
-            deal_id=ctx.deal_id,
+            title=f"Скарга на {dept['name']}",
+            description=description,
+            responsible_id=dept["responsible_id"],
+            deal_id=ctx.deal_id if ctx else None,
+            auditors=auditors,
         )
         return {"ok": True, "task_id": task_id}
     finally:

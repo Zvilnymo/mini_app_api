@@ -33,10 +33,29 @@ def _resolve_webhook() -> str:
 BITRIX_WEBHOOK = _resolve_webhook()
 
 
-def _post(method: str, payload: dict, timeout: int = 15) -> dict:
-    if not BITRIX_WEBHOOK:
+def _resolve_task_webhook() -> str:
+    # tasks.task.add needs its own webhook (BITRIX_WEBHOOK_TASK, added on
+    # Render) — the deals webhook's token isn't scoped for task creation.
+    # Same B24_DOMAIN/B24_USER_ID as the deals webhook, just a different
+    # token. Falls back to the deals webhook if this one isn't configured.
+    token = os.getenv("BITRIX_WEBHOOK_TASK")
+    if not token:
+        return BITRIX_WEBHOOK
+    domain = os.getenv("B24_DOMAIN", "")
+    user_id = os.getenv("B24_USER_ID", "")
+    if domain and user_id:
+        return f"https://{domain}/rest/{user_id}/{token}/"
+    return BITRIX_WEBHOOK
+
+
+BITRIX_WEBHOOK_TASK = _resolve_task_webhook()
+
+
+def _post(method: str, payload: dict, timeout: int = 15, webhook: str = "") -> dict:
+    webhook = webhook or BITRIX_WEBHOOK
+    if not webhook:
         raise RuntimeError("BITRIX_WEBHOOK is not configured")
-    url = BITRIX_WEBHOOK.rstrip("/") + "/" + method
+    url = webhook.rstrip("/") + "/" + method
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
@@ -58,7 +77,8 @@ def _post(method: str, payload: dict, timeout: int = 15) -> dict:
     return result
 
 
-def create_complaint_task(*, title: str, description: str, responsible_id: int, deal_id: int | None = None) -> int:
+def create_complaint_task(*, title: str, description: str, responsible_id: int, deal_id: int | None = None,
+                           auditors: list[int] | None = None) -> int:
     fields = {
         "TITLE": title,
         "DESCRIPTION": description,
@@ -68,5 +88,10 @@ def create_complaint_task(*, title: str, description: str, responsible_id: int, 
     }
     if deal_id:
         fields["UF_CRM_TASK"] = [f"D_{deal_id}"]
-    result = _post("tasks.task.add", {"fields": fields})
+    if auditors:
+        # "В копію" — AUDITORS get notified and can see the task, without
+        # being the one it's assigned to (RESPONSIBLE_ID stays the
+        # department head).
+        fields["AUDITORS"] = auditors
+    result = _post("tasks.task.add", {"fields": fields}, webhook=BITRIX_WEBHOOK_TASK)
     return result["result"]["task"]["id"]

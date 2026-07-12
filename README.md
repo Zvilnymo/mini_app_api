@@ -11,9 +11,13 @@ duplicating it:
 - `ai_document_validator.py` and `prompts.py` are copied from `documents_bot`
   (not imported across repos) — keep them in sync by hand if the validation
   prompts change there.
-- `BITRIX_WEBHOOK` is used for two write paths with no warehouse equivalent:
-  - `POST /api/complaints` — creates a Bitrix24 task assigned to the case's
-    manager. Needs `tasks.task.add` permission.
+- `BITRIX_WEBHOOK` / `BITRIX_WEBHOOK_TASK` are used for write paths with no
+  warehouse equivalent:
+  - `POST /api/complaints` — creates a Bitrix24 task routed by department
+    (see `complaints.py` for the department -> RESPONSIBLE_ID mapping and
+    who's always CC'd via AUDITORS), mirroring `complaint_bot`'s flow. Uses
+    `BITRIX_WEBHOOK_TASK` specifically, since the deals webhook's token
+    isn't scoped for `tasks.task.add`.
   - `POST /api/documents/upload` — uploads the file into Bitrix24 Disk
     (company common storage, see `bitrix_disk.py`), same folder layout
     (`{full name} | {phone}` -> subfolders) documents_bot uses on Google
@@ -27,8 +31,11 @@ duplicating it:
 - `TELEGRAM_BOT_TOKEN` — same bot that hosts documents_bot (validates the
   Mini App's initData)
 - `OPENAI_API_KEY` — used by ai_document_validator.py
-- `BITRIX_WEBHOOK` — same webhook documents_bot uses, must allow
-  `tasks.task.add` and `disk.*` (folder/file read+write)
+- `BITRIX_WEBHOOK` — same webhook documents_bot uses, must allow `disk.*`
+  (folder/file read+write)
+- `BITRIX_WEBHOOK_TASK` — separate webhook token (same `B24_DOMAIN`/
+  `B24_USER_ID`, different token) scoped for `tasks.task.add`, used only by
+  `POST /api/complaints`. Falls back to `BITRIX_WEBHOOK` if unset.
 - `CORS_ORIGIN` — the mini_app Static Site's URL
 
 ## Local dev
