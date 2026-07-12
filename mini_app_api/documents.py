@@ -103,6 +103,7 @@ def checklist_for_client(conn, client_id: int | None) -> list[dict]:
             "required": meta["required"],
             "uploadable": doc_type in UPLOADABLE_TYPES,
             "text_input": doc_type in TEXT_TYPES,
+            "multiple": bool(meta.get("multiple")),
             "uploaded_count": len(docs),
             "latest_status": docs[0]["validation_status"] if docs else None,
         })
