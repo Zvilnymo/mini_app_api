@@ -416,6 +416,32 @@ def get_invoices(conn, contact_id: int):
 
 
 # ---------------------------------------------------------------------------
+# docbot.invoice_receipts — tracks "client submitted a receipt, awaiting
+# manager review" per invoice. crm.fact_invoices itself is a read-only ETL
+# mirror of Bitrix (see payments.py) — this local table is what lets the
+# Cabinet show a "На перевірці" state that survives reloads, until the
+# invoice's own stage_id actually flips to paid on Bitrix's side.
+# ---------------------------------------------------------------------------
+
+def mark_receipt_submitted(conn, invoice_id: int, client_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO docbot.invoice_receipts (invoice_id, client_id) VALUES (%s, %s)
+            ON CONFLICT (invoice_id) DO UPDATE SET submitted_at = CURRENT_TIMESTAMP
+            """,
+            (invoice_id, client_id),
+        )
+        conn.commit()
+
+
+def get_pending_receipt_invoice_ids(conn, client_id: int) -> set[int]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT invoice_id FROM docbot.invoice_receipts WHERE client_id = %s", (client_id,))
+        return {row["invoice_id"] for row in cur.fetchall()}
+
+
+# ---------------------------------------------------------------------------
 # docbot.events / event_rsvp / event_attendance / event_feedback — "Зустрічі"
 # (conferences), ported from conf_bot's self-contained Postgres schema (no
 # Bitrix involvement there either). Unlike conf_bot's automatic bulk-invite

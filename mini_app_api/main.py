@@ -113,7 +113,7 @@ def _load_case_context(conn, phone: str) -> Optional[CaseContext]:
     return CaseContext(contact, deal, pre_court, court)
 
 
-def _case_and_payments(conn, ctx: CaseContext):
+def _case_and_payments(conn, ctx: CaseContext, client_id: int):
     step = stages.compute_step(ctx.deal, ctx.pre_court, ctx.court)
     current_stage_id = ctx.active["stage_id"] if ctx.active else None
     case = {
@@ -124,10 +124,11 @@ def _case_and_payments(conn, ctx: CaseContext):
     }
 
     invoices = db.get_invoices(conn, ctx.contact["id"])
+    pending_receipt_ids = db.get_pending_receipt_invoice_ids(conn, client_id)
     paid_total = sum(float(i["amount"] or 0) for i in invoices if i["stage_id"] in db.PAID_INVOICE_STAGES)
     unpaid_total = sum(float(i["amount"] or 0) for i in invoices if i["stage_id"] not in db.PAID_INVOICE_STAGES)
     payments = {
-        "invoices": [dict(i) for i in invoices],
+        "invoices": [{**dict(i), "receipt_pending": i["id"] in pending_receipt_ids} for i in invoices],
         "paid_total": paid_total,
         "unpaid_total": unpaid_total,
     }
@@ -164,7 +165,7 @@ def get_me(authorization: Optional[str] = Header(default=None)):
         case = payments = debt_overview = None
         days_active = None
         if ctx:
-            case, payments, debt_overview, days_active = _case_and_payments(conn, ctx)
+            case, payments, debt_overview, days_active = _case_and_payments(conn, ctx, client["id"])
 
         # The debt amount as originally declared at the lead stage — shown on
         # Home as the client's headline debt figure (per business request:
@@ -300,6 +301,8 @@ async def upload_payment_receipt(
             uploaded = payments.upload_receipt(client, invoice_id, invoice["title"] or "Рахунок", file.filename, content)
         except Exception as e:
             raise HTTPException(502, f"Не вдалося зберегти квитанцію: {e}")
+
+        db.mark_receipt_submitted(conn, invoice_id, client["id"])
 
         notifications.notify_admins(
             conn,
