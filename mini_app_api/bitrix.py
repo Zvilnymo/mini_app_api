@@ -9,6 +9,7 @@ _bitrix_post convention in telegram_bot.py.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import urllib.error
@@ -95,3 +96,37 @@ def create_complaint_task(*, title: str, description: str, responsible_id: int, 
         fields["AUDITORS"] = auditors
     result = _post("tasks.task.add", {"fields": fields}, webhook=BITRIX_WEBHOOK_TASK)
     return result["result"]["task"]["id"]
+
+
+# Рахунки (invoices) are a Bitrix24 Smart Process, entityTypeId=31 — same
+# entity etl_zv's crm.item.list pulls into crm.fact_invoices (see db.py's
+# PAID_INVOICE_STAGES / get_invoices), confirmed by the "DT31_1:..." stage
+# ID prefix. No existing write path touches invoices at all — documents_bot's
+# old receipt flow only ever saved to Google Drive + a Telegram ping, never
+# Bitrix — so this is new.
+INVOICE_ENTITY_TYPE_ID = 31
+
+# Custom "file" UF field added directly on the Рахунки (invoices) Smart
+# Process item — the receipt goes here in addition to Bitrix Disk, so it's
+# visible right on the invoice card itself, not just linked from a comment.
+INVOICE_RECEIPT_FIELD = "ufCrm_SMART_INVOICE_1783867026383"
+
+
+def add_invoice_comment(invoice_id: int, comment: str) -> int:
+    result = _post(
+        "crm.timeline.comment.add",
+        {"fields": {"ENTITY_TYPE_ID": INVOICE_ENTITY_TYPE_ID, "ENTITY_ID": invoice_id, "COMMENT": comment}},
+    )
+    return result["result"]
+
+
+def set_invoice_receipt_file(invoice_id: int, filename: str, content: bytes) -> None:
+    encoded = base64.b64encode(content).decode("ascii")
+    _post(
+        "crm.item.update",
+        {
+            "entityTypeId": INVOICE_ENTITY_TYPE_ID,
+            "id": invoice_id,
+            "fields": {INVOICE_RECEIPT_FIELD: [filename, encoded]},
+        },
+    )

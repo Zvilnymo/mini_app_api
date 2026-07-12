@@ -35,6 +35,7 @@ SUBFOLDERS = {
     "expenses_confirmation": "Підвердження витрат",
     "debt_confirmation": "Підвердження заборгованості",
     "additional": "Додаткові документи",
+    "receipts": "Квитанції про оплату",
 }
 
 

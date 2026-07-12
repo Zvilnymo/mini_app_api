@@ -24,6 +24,18 @@ duplicating it:
     Drive, but this is a **separate, unrelated destination** — nothing here
     touches documents_bot's Google Drive folders. Needs `disk` (folder read/
     write/upload) permission on the webhook.
+  - `POST /api/payments/{invoice_id}/receipt` — uploads a payment receipt
+    into the same Bitrix Disk client folder, sets it directly on the
+    invoice's own file field (`INVOICE_RECEIPT_FIELD` in `bitrix.py`, UF
+    code `ufCrm_SMART_INVOICE_1783867026383`), and posts a comment linking
+    to the Disk copy on that invoice's timeline (`crm.timeline.comment.add`,
+    invoice = Bitrix Smart Process entityTypeId=31, see
+    `payments.py`/`bitrix.py`).
+    This is new — `documents_bot`'s old receipt flow only ever saved to
+    Google Drive and pinged admins over Telegram, it never touched Bitrix.
+    The app never changes the invoice's stage itself; a manager reviews the
+    receipt on the invoice and moves it manually. Needs `crm` (timeline
+    write) permission on the webhook.
 
 ## Env vars
 
@@ -32,7 +44,8 @@ duplicating it:
   Mini App's initData)
 - `OPENAI_API_KEY` — used by ai_document_validator.py
 - `BITRIX_WEBHOOK` — same webhook documents_bot uses, must allow `disk.*`
-  (folder/file read+write)
+  (folder/file read+write) and `crm` (timeline comment write, for invoice
+  receipts)
 - `BITRIX_WEBHOOK_TASK` — separate webhook token (same `B24_DOMAIN`/
   `B24_USER_ID`, different token) scoped for `tasks.task.add`, used only by
   `POST /api/complaints`. Falls back to `BITRIX_WEBHOOK` if unset.

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ai_document_validator import validator as ai_validator
 
-from . import bitrix, complaints, db, declaration, documents, stages
+from . import bitrix, complaints, db, declaration, documents, notifications, payments, stages
 from .telegram_auth import InvalidInitData, validate_init_data
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -243,6 +243,44 @@ def create_complaint(
             auditors=auditors,
         )
         return {"ok": True, "task_id": task_id}
+    finally:
+        conn.close()
+
+
+@app.post("/api/payments/{invoice_id}/receipt")
+async def upload_payment_receipt(
+    invoice_id: int,
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        ctx = _load_case_context(conn, client["phone"])
+        if not ctx:
+            raise HTTPException(422, "Не вдалося знайти вашу справу в CRM.")
+        # Only let a client attach a receipt to one of their own invoices —
+        # never trust invoice_id from the request alone.
+        invoice = next((i for i in db.get_invoices(conn, ctx.contact["id"]) if i["id"] == invoice_id), None)
+        if not invoice:
+            raise HTTPException(404, "Рахунок не знайдено")
+
+        content = await file.read()
+        try:
+            uploaded = payments.upload_receipt(client, invoice_id, invoice["title"] or "Рахунок", file.filename, content)
+        except Exception as e:
+            raise HTTPException(502, f"Не вдалося зберегти квитанцію: {e}")
+
+        notifications.notify_admins(
+            conn,
+            f"💳 <b>Клієнт завантажив квитанцію про оплату</b>\n\n"
+            f"👤 {client['full_name']}\n"
+            f"📱 {client['phone']}\n"
+            f"📄 Рахунок: {invoice['title'] or invoice_id}\n"
+            f'📁 <a href="{uploaded.get("webViewLink")}">Переглянути квитанцію</a>',
+        )
+        return {"ok": True}
     finally:
         conn.close()
 
