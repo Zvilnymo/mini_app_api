@@ -21,7 +21,7 @@ from PIL import Image, UnidentifiedImageError
 
 from ai_document_validator import validator as ai_validator
 
-from . import db
+from . import db, notifications
 from .bitrix_disk import BitrixDiskManager, SUBFOLDERS
 
 # Phone camera photos routinely come in at 10-20+ MB. Base64-encoding the
@@ -158,6 +158,21 @@ def upload_document(conn, client: dict, document_type: str, filename: str, conte
         file_size=int(uploaded.get("size", len(content))),
         validation_status=validation_status,
     )
+
+    checklist = checklist_for_client(conn, client["id"])
+    docs_ready = sum(1 for d in checklist if d["latest_status"] in ("accepted", "pending"))
+    client_folder = disk.get_or_create_client_folder(client["full_name"], client["phone"])
+    notifications.notify_document_uploaded(
+        conn,
+        client=client,
+        doc_name=meta["name"],
+        validation_status=validation_status,
+        file_url=uploaded.get("webViewLink"),
+        folder_url=client_folder.get("webViewLink"),
+        docs_ready=docs_ready,
+        docs_total=len(checklist),
+    )
+
     return {
         "document": row,
         "validation_status": validation_status,

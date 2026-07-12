@@ -12,6 +12,9 @@ from .telegram_auth import InvalidInitData, validate_init_data
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")
+# Mirrors documents_bot's admin deep-link (/start admin_<code>) — same
+# secret code, reached through the mini app instead of the bot's /start.
+ADMIN_SECRET_CODE = os.getenv("ADMIN_SECRET_CODE")
 
 app = FastAPI(title="Zvilnymo mini app API")
 
@@ -227,6 +230,22 @@ def register(phone: str = Form(...), authorization: Optional[str] = Header(defau
         )
         client = db.create_client(conn, user["id"], full_name, phone)
         return {"registered": True, "client": {"id": client["id"], "full_name": client["full_name"], "phone": client["phone"]}}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/register")
+def register_admin(code: str = Form(...), authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    if not ADMIN_SECRET_CODE:
+        raise HTTPException(500, "server misconfigured: ADMIN_SECRET_CODE not set")
+    if code != ADMIN_SECRET_CODE:
+        raise HTTPException(403, "invalid code")
+    full_name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or user.get("username")
+    conn = db.get_connection()
+    try:
+        db.register_admin(conn, user["id"], full_name)
+        return {"ok": True}
     finally:
         conn.close()
 

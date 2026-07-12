@@ -191,6 +191,35 @@ def complete_declaration(conn, client_id: int, attempt: int = 1):
         conn.commit()
 
 
+# ---------------------------------------------------------------------------
+# docbot.admins — Telegram IDs to notify on client activity (document
+# uploads, etc). Replaces documents_bot's admins.txt file: that file lives
+# on the bot service's own disk, unreachable from mini_app_api, and is
+# wiped on redeploy if no persistent disk is mounted there. Postgres is
+# already shared between both services and isn't ephemeral, so it's the
+# more reliable home for this list going forward.
+# ---------------------------------------------------------------------------
+
+def get_admin_ids(conn) -> list[int]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT telegram_id FROM docbot.admins ORDER BY added_at")
+        return [row["telegram_id"] for row in cur.fetchall()]
+
+
+def register_admin(conn, telegram_id: int, full_name: str | None = None):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO docbot.admins (telegram_id, full_name) VALUES (%s, %s)
+            ON CONFLICT (telegram_id) DO NOTHING
+            RETURNING *
+            """,
+            (telegram_id, full_name),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
 def get_documents_by_client(conn, client_id: int):
     with conn.cursor() as cur:
         cur.execute(
