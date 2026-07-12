@@ -78,6 +78,12 @@ def get_client_by_phone(conn, phone: str):
         return cur.fetchone()
 
 
+def get_client_by_id(conn, client_id: int):
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM docbot.clients WHERE id = %s", (client_id,))
+        return cur.fetchone()
+
+
 def create_client(conn, telegram_id: int, full_name: str, phone: str):
     with conn.cursor() as cur:
         cur.execute(
@@ -198,26 +204,36 @@ def complete_declaration(conn, client_id: int, attempt: int = 1):
 # wiped on redeploy if no persistent disk is mounted there. Postgres is
 # already shared between both services and isn't ephemeral, so it's the
 # more reliable home for this list going forward.
+#
+# `scope` distinguishes which admin panel someone registered for
+# ('documents' vs 'conferences', see main.py's two admin_secret_code deep
+# links) — PK is (telegram_id, scope) so one person can hold both.
 # ---------------------------------------------------------------------------
 
-def get_admin_ids(conn) -> list[int]:
+def get_admin_ids(conn, scope: str = "documents") -> list[int]:
     with conn.cursor() as cur:
-        cur.execute("SELECT telegram_id FROM docbot.admins ORDER BY added_at")
+        cur.execute("SELECT telegram_id FROM docbot.admins WHERE scope = %s ORDER BY added_at", (scope,))
         return [row["telegram_id"] for row in cur.fetchall()]
 
 
-def register_admin(conn, telegram_id: int, full_name: str | None = None):
+def register_admin(conn, telegram_id: int, full_name: str | None = None, scope: str = "documents"):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO docbot.admins (telegram_id, full_name) VALUES (%s, %s)
-            ON CONFLICT (telegram_id) DO NOTHING
+            INSERT INTO docbot.admins (telegram_id, full_name, scope) VALUES (%s, %s, %s)
+            ON CONFLICT (telegram_id, scope) DO NOTHING
             RETURNING *
             """,
-            (telegram_id, full_name),
+            (telegram_id, full_name, scope),
         )
         conn.commit()
         return cur.fetchone()
+
+
+def is_admin(conn, telegram_id: int, scope: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM docbot.admins WHERE telegram_id = %s AND scope = %s", (telegram_id, scope))
+        return cur.fetchone() is not None
 
 
 def get_documents_by_client(conn, client_id: int):
@@ -397,3 +413,245 @@ def get_invoices(conn, contact_id: int):
             (contact_id,),
         )
         return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# docbot.events / event_rsvp / event_attendance / event_feedback — "Зустрічі"
+# (conferences), ported from conf_bot's self-contained Postgres schema (no
+# Bitrix involvement there either). Unlike conf_bot's automatic bulk-invite
+# eligibility engine (per-type dedup, daily RSVP limits, type-4-needs-type-1
+# prerequisites), an admin here always picks recipients explicitly — same
+# client-visible behavior (invite -> RSVP -> reminder -> feedback), simpler
+# admin-side implementation.
+# ---------------------------------------------------------------------------
+
+def list_event_types(conn, active_only: bool = True):
+    with conn.cursor() as cur:
+        if active_only:
+            cur.execute("SELECT * FROM docbot.event_types WHERE active ORDER BY type_code")
+        else:
+            cur.execute("SELECT * FROM docbot.event_types ORDER BY type_code")
+        return cur.fetchall()
+
+
+def get_client_events(conn, client_id: int):
+    """Every event this client has been invited to, most recent first,
+    each row carrying that client's own rsvp/attendance/feedback state."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT e.event_id, e.title, e.description, e.start_at, e.duration_min,
+                   e.format, e.link, e.person_name, e.person_role,
+                   r.rsvp, r.rsvp_at,
+                   a.attended,
+                   f.stars AS feedback_stars, f.comment AS feedback_comment
+            FROM docbot.event_rsvp r
+            JOIN docbot.events e ON e.event_id = r.event_id
+            LEFT JOIN docbot.event_attendance a ON a.event_id = r.event_id AND a.client_id = r.client_id
+            LEFT JOIN docbot.event_feedback f ON f.event_id = r.event_id AND f.client_id = r.client_id
+            WHERE r.client_id = %s
+            ORDER BY e.start_at DESC
+            """,
+            (client_id,),
+        )
+        return cur.fetchall()
+
+
+def get_client_event(conn, event_id: int, client_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT e.*, r.rsvp FROM docbot.events e
+            JOIN docbot.event_rsvp r ON r.event_id = e.event_id
+            WHERE e.event_id = %s AND r.client_id = %s
+            """,
+            (event_id, client_id),
+        )
+        return cur.fetchone()
+
+
+def submit_rsvp(conn, event_id: int, client_id: int, rsvp: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE docbot.event_rsvp SET rsvp = %s, rsvp_at = CURRENT_TIMESTAMP
+            WHERE event_id = %s AND client_id = %s
+            RETURNING *
+            """,
+            (rsvp, event_id, client_id),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def submit_feedback(conn, event_id: int, client_id: int, stars: int, comment: str | None):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO docbot.event_feedback (event_id, client_id, stars, comment)
+            VALUES (%s, %s, %s, %s)
+            RETURNING *
+            """,
+            (event_id, client_id, stars, comment),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def create_event(conn, *, type_code: int | None, title: str, description: str | None, start_at,
+                  duration_min: int, format: str, link: str | None, person_name: str | None,
+                  person_role: str | None, created_by: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO docbot.events
+                (type_code, title, description, start_at, duration_min, format, link,
+                 person_name, person_role, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *
+            """,
+            (type_code, title, description, start_at, duration_min, format, link,
+             person_name, person_role, created_by),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def update_event_field(conn, event_id: int, field: str, value):
+    # Whitelisted, mirrors conf_bot's editable-field set — never build this
+    # from unvalidated request input.
+    if field not in ("title", "description", "start_at", "duration_min", "format", "link",
+                      "person_name", "person_role"):
+        raise ValueError(f"non-editable event field: {field}")
+    with conn.cursor() as cur:
+        cur.execute(f"UPDATE docbot.events SET {field} = %s WHERE event_id = %s RETURNING *", (value, event_id))
+        conn.commit()
+        return cur.fetchone()
+
+
+def get_event(conn, event_id: int):
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM docbot.events WHERE event_id = %s", (event_id,))
+        return cur.fetchone()
+
+
+def list_events(conn, upcoming: bool = True, limit: int = 100):
+    with conn.cursor() as cur:
+        if upcoming:
+            cur.execute(
+                "SELECT * FROM docbot.events WHERE start_at >= now() ORDER BY start_at LIMIT %s", (limit,)
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM docbot.events WHERE start_at < now() ORDER BY start_at DESC LIMIT %s", (limit,)
+            )
+        return cur.fetchall()
+
+
+def get_event_rsvp_rows(conn, event_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.client_id, r.rsvp, r.rsvp_at, c.full_name, c.phone, c.telegram_id
+            FROM docbot.event_rsvp r
+            JOIN docbot.clients c ON c.id = r.client_id
+            WHERE r.event_id = %s
+            ORDER BY r.invited_at
+            """,
+            (event_id,),
+        )
+        return cur.fetchall()
+
+
+def get_going_clients(conn, event_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.id AS client_id, c.telegram_id, c.full_name
+            FROM docbot.event_rsvp r
+            JOIN docbot.clients c ON c.id = r.client_id
+            WHERE r.event_id = %s AND r.rsvp = 'going'
+            """,
+            (event_id,),
+        )
+        return cur.fetchall()
+
+
+def delete_event(conn, event_id: int):
+    # Matches conf_bot's own behavior: cancel = hard delete, no status flag.
+    # RSVP/attendance/feedback rows cascade via FK ON DELETE CASCADE.
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM docbot.events WHERE event_id = %s", (event_id,))
+        conn.commit()
+
+
+def search_clients(conn, query: str, limit: int = 20):
+    """For the admin's "invite" picker — match by name or phone digits."""
+    digits = re.sub(r"[^0-9]", "", query)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, full_name, phone, telegram_id FROM docbot.clients
+            WHERE full_name ILIKE %s OR (%s <> '' AND regexp_replace(phone, '[^0-9]', '', 'g') LIKE %s)
+            ORDER BY full_name
+            LIMIT %s
+            """,
+            (f"%{query}%", digits, f"%{digits}%", limit),
+        )
+        return cur.fetchall()
+
+
+def invite_clients(conn, event_id: int, client_ids: list[int]):
+    with conn.cursor() as cur:
+        for client_id in client_ids:
+            cur.execute(
+                """
+                INSERT INTO docbot.event_rsvp (event_id, client_id) VALUES (%s, %s)
+                ON CONFLICT (event_id, client_id) DO NOTHING
+                """,
+                (event_id, client_id),
+            )
+        conn.commit()
+
+
+def mark_attendance(conn, event_id: int, client_id: int, attended: bool):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO docbot.event_attendance (event_id, client_id, attended, marked_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (event_id, client_id) DO UPDATE
+            SET attended = EXCLUDED.attended, marked_at = EXCLUDED.marked_at
+            """,
+            (event_id, client_id, attended),
+        )
+        conn.commit()
+
+
+def get_events_needing_reminder(conn, window: str):
+    """window: '24h' or '60m' — events starting soon whose 'going' clients
+    haven't been reminded yet at this window."""
+    col = "reminded_24h" if window == "24h" else "reminded_60m"
+    interval = "24 hours" if window == "24h" else "60 minutes"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT r.event_id, r.client_id, c.telegram_id, e.title, e.start_at, e.link
+            FROM docbot.event_rsvp r
+            JOIN docbot.events e ON e.event_id = r.event_id
+            JOIN docbot.clients c ON c.id = r.client_id
+            WHERE r.rsvp = 'going' AND NOT r.{col}
+              AND e.start_at BETWEEN now() AND now() + interval '{interval}'
+            """,
+        )
+        return cur.fetchall()
+
+
+def mark_reminded(conn, event_id: int, client_id: int, window: str):
+    col = "reminded_24h" if window == "24h" else "reminded_60m"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE docbot.event_rsvp SET {col} = TRUE WHERE event_id = %s AND client_id = %s",
+            (event_id, client_id),
+        )
+        conn.commit()

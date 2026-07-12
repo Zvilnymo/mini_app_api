@@ -43,19 +43,29 @@ def _send_message(chat_id: int, text: str, timeout: int = 10) -> None:
         logger.error(f"Failed to notify admin {chat_id}: {e}")
 
 
-def notify_admins(conn, text: str) -> None:
+def notify_admins(conn, text: str, scope: str = "documents") -> None:
     """Best-effort — a notification failure must never break the upload
     that triggered it, so every error here is swallowed after logging."""
     try:
-        admin_ids = db.get_admin_ids(conn)
+        admin_ids = db.get_admin_ids(conn, scope=scope)
     except Exception as e:
         logger.error(f"Failed to load admin ids: {e}")
         return
     if not admin_ids:
-        logger.warning("No admins in docbot.admins to notify")
+        logger.warning(f"No admins in docbot.admins (scope={scope}) to notify")
         return
     for admin_id in admin_ids:
         _send_message(admin_id, text)
+
+
+def notify_client(telegram_id: int, text: str) -> None:
+    """Best-effort DM to a client — e.g. a new meeting invite, a reminder,
+    or an admin editing/cancelling one they'd already RSVP'd 'going' to.
+    Unlike a Telegram bot's own inline-keyboard invites (which need a
+    polling/webhook process to receive the callback), this is a plain
+    message: "open the app" — the actual RSVP/feedback interaction happens
+    in the Mini App itself, not in the Telegram chat."""
+    _send_message(telegram_id, text)
 
 
 def notify_document_uploaded(conn, *, client: dict, doc_name: str, validation_status: str | None,

@@ -1,20 +1,28 @@
+import logging
 import os
 from datetime import date, datetime
 from typing import Optional
 
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from ai_document_validator import validator as ai_validator
 
-from . import bitrix, complaints, db, declaration, documents, notifications, payments, stages
+from . import bitrix, complaints, conferences, db, declaration, documents, notifications, payments, stages
 from .telegram_auth import InvalidInitData, validate_init_data
+
+logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")
 # Mirrors documents_bot's admin deep-link (/start admin_<code>) — same
 # secret code, reached through the mini app instead of the bot's /start.
 ADMIN_SECRET_CODE = os.getenv("ADMIN_SECRET_CODE")
+# Second, independent admin panel (Зустрічі) — its own code/scope, so
+# document-admins and conference-admins aren't automatically the same
+# people (see docbot.admins' scope column).
+CONF_ADMIN_SECRET_CODE = os.getenv("CONF_ADMIN_SECRET_CODE")
 
 app = FastAPI(title="Zvilnymo mini app API")
 
@@ -24,6 +32,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _send_conference_reminders() -> None:
+    # Own connection — runs on the scheduler's own thread, not a request.
+    conn = db.get_connection()
+    try:
+        conferences.send_reminders(conn)
+    except Exception as e:
+        logger.error(f"Failed to send conference reminders: {e}")
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+def _start_scheduler():
+    # Mirrors conf_bot's own in-process APScheduler (it has no separate
+    # worker service either) — checks every 5 minutes for 'going' clients
+    # due a 24h or 60m reminder (see db.get_events_needing_reminder).
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_job(_send_conference_reminders, "interval", minutes=5, id="conference_reminders")
+    scheduler.start()
 
 
 def authenticate(authorization: Optional[str] = Header(default=None)) -> dict:
@@ -308,15 +337,17 @@ def register(phone: str = Form(...), authorization: Optional[str] = Header(defau
 @app.post("/api/admin/register")
 def register_admin(code: str = Form(...), authorization: Optional[str] = Header(default=None)):
     user = authenticate(authorization)
-    if not ADMIN_SECRET_CODE:
-        raise HTTPException(500, "server misconfigured: ADMIN_SECRET_CODE not set")
-    if code != ADMIN_SECRET_CODE:
+    if ADMIN_SECRET_CODE and code == ADMIN_SECRET_CODE:
+        scope = "documents"
+    elif CONF_ADMIN_SECRET_CODE and code == CONF_ADMIN_SECRET_CODE:
+        scope = "conferences"
+    else:
         raise HTTPException(403, "invalid code")
     full_name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or user.get("username")
     conn = db.get_connection()
     try:
-        db.register_admin(conn, user["id"], full_name)
-        return {"ok": True}
+        db.register_admin(conn, user["id"], full_name, scope=scope)
+        return {"ok": True, "scope": scope}
     finally:
         conn.close()
 
@@ -326,6 +357,11 @@ def _require_client(conn, user: dict) -> dict:
     if not client:
         raise HTTPException(404, "client not registered yet, POST /api/register first")
     return client
+
+
+def _require_admin(conn, user: dict, scope: str) -> None:
+    if not db.is_admin(conn, user["id"], scope):
+        raise HTTPException(403, f"not an admin for scope={scope}")
 
 
 @app.get("/api/documents")
@@ -420,5 +456,246 @@ def upload_text_document(
                 "drive_file_url": result["document"]["drive_file_url"],
             },
         }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Зустрічі (conferences) — client-facing: view invitations, RSVP, leave
+# feedback after a meeting. See conferences.py's module docstring for why
+# this is all in-app rather than Telegram inline-keyboard callbacks.
+# ---------------------------------------------------------------------------
+
+def _serialize_event_row(row: dict) -> dict:
+    return {
+        "event_id": row["event_id"],
+        "title": row["title"],
+        "description": row["description"],
+        "start_at": row["start_at"].isoformat() if row["start_at"] else None,
+        "duration_min": row["duration_min"],
+        "format": row["format"],
+        "link": row["link"],
+        "person_name": row["person_name"],
+        "person_role": row["person_role"],
+        "rsvp": row["rsvp"],
+        "rsvp_at": row["rsvp_at"].isoformat() if row.get("rsvp_at") else None,
+        "attended": row.get("attended"),
+        "feedback_stars": row.get("feedback_stars"),
+        "feedback_comment": row.get("feedback_comment"),
+    }
+
+
+@app.get("/api/conferences")
+def list_conferences(authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        rows = db.get_client_events(conn, client["id"])
+        return {"events": [_serialize_event_row(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/conferences/{event_id}/rsvp")
+def submit_conference_rsvp(event_id: int, rsvp: str = Body(..., embed=True), authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    if rsvp not in ("going", "declined"):
+        raise HTTPException(400, "rsvp must be 'going' or 'declined'")
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        event = db.get_client_event(conn, event_id, client["id"])
+        if not event:
+            raise HTTPException(404, "you weren't invited to this event")
+        db.submit_rsvp(conn, event_id, client["id"], rsvp)
+        conferences.notify_admins_new_rsvp(conn, client_name=client["full_name"], event_title=event["title"], rsvp=rsvp)
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/conferences/{event_id}/feedback")
+def submit_conference_feedback(
+    event_id: int,
+    stars: int = Body(..., embed=True),
+    comment: Optional[str] = Body(default=None, embed=True),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = authenticate(authorization)
+    if not 1 <= stars <= 5:
+        raise HTTPException(400, "stars must be 1-5")
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        event = db.get_client_event(conn, event_id, client["id"])
+        if not event:
+            raise HTTPException(404, "you weren't invited to this event")
+        db.submit_feedback(conn, event_id, client["id"], stars, comment)
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Зустрічі — admin panel. Reached via startapp=confadmin_<CONF_ADMIN_SECRET_CODE>
+# (see AdminRegister.tsx), gated by docbot.admins' scope='conferences'
+# rather than the document-admin scope.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/admin/conferences/types")
+def admin_list_event_types(authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        return {"types": db.list_event_types(conn, active_only=False)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/conferences/events")
+def admin_list_events(upcoming: bool = True, authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        events = db.list_events(conn, upcoming=upcoming)
+        return {"events": [{**e, "start_at": e["start_at"].isoformat()} for e in events]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/conferences/events/{event_id}")
+def admin_get_event(event_id: int, authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        event = db.get_event(conn, event_id)
+        if not event:
+            raise HTTPException(404, "event not found")
+        rsvp_rows = db.get_event_rsvp_rows(conn, event_id)
+        return {
+            "event": {**event, "start_at": event["start_at"].isoformat()},
+            "invitees": [
+                {
+                    "client_id": r["client_id"],
+                    "full_name": r["full_name"],
+                    "phone": r["phone"],
+                    "rsvp": r["rsvp"],
+                    "rsvp_at": r["rsvp_at"].isoformat() if r["rsvp_at"] else None,
+                }
+                for r in rsvp_rows
+            ],
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/conferences/events")
+def admin_create_event(fields: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        try:
+            start_at = datetime.fromisoformat(fields["start_at"])
+        except (KeyError, ValueError) as e:
+            raise HTTPException(400, f"invalid start_at: {e}")
+        event = db.create_event(
+            conn,
+            type_code=fields.get("type_code"),
+            title=fields["title"],
+            description=fields.get("description"),
+            start_at=start_at,
+            duration_min=int(fields.get("duration_min", 30)),
+            format=fields.get("format", "video"),
+            link=fields.get("link"),
+            person_name=fields.get("person_name"),
+            person_role=fields.get("person_role"),
+            created_by=user["id"],
+        )
+        client_ids = fields.get("client_ids") or []
+        if client_ids:
+            conferences.send_invites(conn, event, client_ids)
+        return {"ok": True, "event_id": event["event_id"]}
+    finally:
+        conn.close()
+
+
+@app.patch("/api/admin/conferences/events/{event_id}")
+def admin_update_event(
+    event_id: int, field: str = Body(...), value: str = Body(...), authorization: Optional[str] = Header(default=None)
+):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        try:
+            db.update_event_field(conn, event_id, field, value)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        conferences.notify_event_update(conn, event_id, f"{field}: {value}")
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/admin/conferences/events/{event_id}")
+def admin_cancel_event(event_id: int, authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        event = db.get_event(conn, event_id)
+        if not event:
+            raise HTTPException(404, "event not found")
+        conferences.notify_event_cancel(conn, event_id, event["title"])
+        db.delete_event(conn, event_id)
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/conferences/clients/search")
+def admin_search_clients(q: str = "", authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        return {"clients": db.search_clients(conn, q)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/conferences/events/{event_id}/invite")
+def admin_invite_clients(event_id: int, client_ids: list[int] = Body(..., embed=True), authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        event = db.get_event(conn, event_id)
+        if not event:
+            raise HTTPException(404, "event not found")
+        conferences.send_invites(conn, event, client_ids)
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/conferences/events/{event_id}/attendance")
+def admin_mark_attendance(
+    event_id: int,
+    client_id: int = Body(..., embed=True),
+    attended: bool = Body(..., embed=True),
+    authorization: Optional[str] = Header(default=None),
+):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        db.mark_attendance(conn, event_id, client_id, attended)
+        return {"ok": True}
     finally:
         conn.close()
