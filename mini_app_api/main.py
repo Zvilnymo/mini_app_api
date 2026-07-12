@@ -137,9 +137,20 @@ def get_me(authorization: Optional[str] = Header(default=None)):
         if ctx:
             case, payments, debt_overview, days_active = _case_and_payments(conn, ctx)
 
+        # The debt amount as originally declared at the lead stage — shown on
+        # Home as the client's headline debt figure (per business request:
+        # it's the "big number that will soon shrink"), independent of
+        # whether a deal/case record exists yet.
+        lead_debt = db.get_lead_debt(conn, db.normalize_phone(client["phone"]))
+
         checklist = documents.checklist_for_client(conn, client["id"])
-        docs_total = len(checklist)
+        # The declaration questionnaire isn't a DOCUMENT_TYPES entry (it's
+        # its own free-text form, not a file upload) but counts as one more
+        # required item everywhere document progress is shown.
+        docs_total = len(checklist) + 1
         docs_ready = sum(1 for d in checklist if d["latest_status"] in ("accepted", "pending"))
+        if declaration.is_complete(conn, client["id"]):
+            docs_ready += 1
 
         # Prefer the CRM's full name over whatever Telegram display name was
         # stored at registration time — the CRM name is the client's real
@@ -157,6 +168,7 @@ def get_me(authorization: Optional[str] = Header(default=None)):
             "case": case,
             "payments": payments,
             "debt_overview": debt_overview,
+            "lead_debt": lead_debt,
             "days_active": days_active,
             "docs_ready": docs_ready,
             "docs_total": docs_total,

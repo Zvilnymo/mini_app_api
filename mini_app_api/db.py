@@ -306,6 +306,26 @@ def get_contact_by_phone(conn, phone_norm: str):
         return cur.fetchone()
 
 
+def get_lead_debt(conn, phone_norm: str):
+    """Debt amount as originally declared at the lead stage (crm.fact_leads),
+    before any deal/case record exists — used on Home as the client's
+    starting debt figure, since fact_deals.total_debt only exists once a
+    deal has actually been created."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT total_debt
+            FROM crm.fact_leads
+            WHERE regexp_replace(phone, '[^0-9]', '', 'g') = %s AND total_debt IS NOT NULL
+            ORDER BY date_create DESC
+            LIMIT 1
+            """,
+            (phone_norm,),
+        )
+        row = cur.fetchone()
+        return float(row["total_debt"]) if row else None
+
+
 def get_deal(conn, contact_id: int):
     """funnel 0 — contract signing."""
     with conn.cursor() as cur:
