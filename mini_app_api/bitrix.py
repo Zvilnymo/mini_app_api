@@ -109,7 +109,7 @@ INVOICE_ENTITY_TYPE_ID = 31
 # Custom "file" UF field added directly on the Рахунки (invoices) Smart
 # Process item — the receipt goes here in addition to Bitrix Disk, so it's
 # visible right on the invoice card itself, not just linked from a comment.
-INVOICE_RECEIPT_FIELD = "UF_CRM_SMART_INVOICE_RECEIPT"
+INVOICE_RECEIPT_FIELD = "ufCrmSmartInvoiceReceipt"
 
 
 def add_invoice_comment(invoice_id: int, comment: str) -> int:
