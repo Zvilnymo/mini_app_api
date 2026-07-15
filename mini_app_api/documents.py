@@ -60,15 +60,15 @@ def _compress_image_if_needed(content: bytes, filename: str) -> tuple[bytes, str
 DOCUMENT_TYPES = {
     "ecpass": {"name": "Пароль від ЕЦП", "emoji": "🔐", "folder": "personal", "required": True, "is_text": True},
     "emailpass": {"name": "Пошта та пароль", "emoji": "📧", "folder": "personal", "required": False, "is_text_email": True},
-    "ecp": {"name": "ЕЦП (електронний цифровий підпис)", "emoji": "📜", "folder": "personal", "required": True},
-    "passport": {"name": "Сканкопія паспорта та РНОКПП (ІПН)", "emoji": "📕", "folder": "personal", "required": True},
-    "registration": {"name": "Витяг з реєстру територіальної громади", "emoji": "🏠", "folder": "personal", "required": True},
-    "workbook": {"name": "Копія трудової книжки", "emoji": "📗", "folder": "personal", "required": False},
-    "credit_contracts": {"name": "Кредитні договори", "emoji": "📑", "folder": "credit", "required": True, "multiple": True},
-    "bank_statements": {"name": "Виписки про залишок коштів на рахунках", "emoji": "🏦", "folder": "personal", "required": True},
-    "expenses": {"name": "Підтвердження витрат за останні місяці", "emoji": "💰", "folder": "expenses_confirmation", "required": True},
-    "story": {"name": "Ваша історія (у форматі Word)", "emoji": "📝", "folder": "personal", "required": True},
-    "family_income": {"name": "Доходи членів сім'ї (довідка з податкової)", "emoji": "💵", "folder": "personal", "required": False},
+    "ecp": {"name": "ЕЦП (електронний цифровий підпис)", "emoji": "📜", "folder": "personal", "required": True, "video": "https://www.youtube.com/watch?v=S5OTYY9hyQY"},
+    "passport": {"name": "Сканкопія паспорта та РНОКПП (ІПН)", "emoji": "📕", "folder": "personal", "required": True, "video": "https://www.youtube.com/shorts/QMyoYlybUOk"},
+    "registration": {"name": "Витяг з реєстру територіальної громади", "emoji": "🏠", "folder": "personal", "required": True, "video": "https://www.youtube.com/shorts/9C5XE1gpGNM"},
+    "workbook": {"name": "Копія трудової книжки", "emoji": "📗", "folder": "personal", "required": False, "video": "https://www.youtube.com/shorts/xB-xZUD_yu8"},
+    "credit_contracts": {"name": "Кредитні договори", "emoji": "📑", "folder": "credit", "required": True, "multiple": True, "video": "https://www.youtube.com/shorts/vhOq-iw_B0A"},
+    "bank_statements": {"name": "Виписки про залишок коштів на рахунках", "emoji": "🏦", "folder": "personal", "required": True, "video": "https://www.youtube.com/shorts/5yzLPrDhImo"},
+    "expenses": {"name": "Підтвердження витрат за останні місяці", "emoji": "💰", "folder": "expenses_confirmation", "required": True, "video": "https://www.youtube.com/shorts/YfYkxGiyATo"},
+    "story": {"name": "Ваша історія (у форматі Word)", "emoji": "📝", "folder": "personal", "required": True, "video": "https://www.youtube.com/shorts/KkFbbSkF6Jg"},
+    "family_income": {"name": "Доходи членів сім'ї (довідка з податкової)", "emoji": "💵", "folder": "personal", "required": False, "video": "https://www.youtube.com/watch?v=fqhRCe-cMAc"},
     "debt_certificates": {"name": "Довідки про стан заборгованості", "emoji": "📋", "folder": "debt_confirmation", "required": True},
     "executive": {"name": "Виписки по виконавчих провадженнях", "emoji": "⚖️", "folder": "personal", "required": False},
     "additional_docs": {"name": "Додаткові документи", "emoji": "📎", "folder": "additional", "required": False, "skip_ai_validation": True},
@@ -106,6 +106,7 @@ def checklist_for_client(conn, client_id: int | None) -> list[dict]:
             "multiple": bool(meta.get("multiple")),
             "uploaded_count": len(docs),
             "latest_status": docs[0]["validation_status"] if docs else None,
+            "video_url": meta.get("video"),
         })
     return items
 
