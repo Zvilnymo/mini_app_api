@@ -3,6 +3,7 @@ import os
 from datetime import date, datetime
 from typing import Optional
 
+import psycopg2
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Body, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -331,7 +332,15 @@ def register(phone: str = Form(...), authorization: Optional[str] = Header(defau
             if crm_contact and crm_contact.get("full_name")
             else " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or user.get("username") or "Client"
         )
-        client = db.create_client(conn, user["id"], full_name, phone)
+        try:
+            client = db.create_client(conn, user["id"], full_name, phone)
+        except (db.PhoneAlreadyLinked, psycopg2.errors.UniqueViolation):
+            conn.rollback()
+            raise HTTPException(
+                409,
+                "Цей номер телефону вже прив'язано до іншого Telegram-акаунта. "
+                "Увійдіть у застосунок з того акаунта або зверніться до адміністратора.",
+            )
         return {"registered": True, "client": {"id": client["id"], "full_name": client["full_name"], "phone": client["phone"]}}
     finally:
         conn.close()

@@ -84,8 +84,29 @@ def get_client_by_id(conn, client_id: int):
         return cur.fetchone()
 
 
+class PhoneAlreadyLinked(Exception):
+    """Raised when the phone being registered already belongs to a different telegram_id."""
+
+
 def create_client(conn, telegram_id: int, full_name: str, phone: str):
+    phone = normalize_phone(phone)
     with conn.cursor() as cur:
+        # Telegram verifies the phone via requestContact, but that only
+        # proves the *current* device owns the number right now — it doesn't
+        # prove this is the same person who registered it earlier. Rebinding
+        # automatically would let anyone with access to that phone (family
+        # member, new SIM owner) hijack another client's documents/case, so
+        # a phone already claimed by a different telegram_id is refused, not
+        # silently reassigned (see docbot.clients' UNIQUE(phone), which this
+        # used to bypass by storing the raw, unnormalized phone string).
+        cur.execute(
+            "SELECT telegram_id FROM docbot.clients WHERE regexp_replace(phone, '[^0-9]', '', 'g') = %s",
+            (phone,),
+        )
+        existing = cur.fetchone()
+        if existing and existing["telegram_id"] != telegram_id:
+            raise PhoneAlreadyLinked(phone)
+
         cur.execute(
             """
             INSERT INTO docbot.clients (telegram_id, full_name, phone)
