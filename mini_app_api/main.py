@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import psycopg2
@@ -530,6 +530,26 @@ def submit_conference_rsvp(event_id: int, rsvp: str = Body(..., embed=True), aut
         db.submit_rsvp(conn, event_id, client["id"], rsvp)
         conferences.notify_admins_new_rsvp(conn, client_name=client["full_name"], event_title=event["title"], rsvp=rsvp)
         return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/conferences/{event_id}/join")
+def join_conference(event_id: int, authorization: Optional[str] = Header(default=None)):
+    # Marks attendance when the client actually joins — but only once the
+    # meeting has started, so an early/curious tap on "Приєднатися" (e.g.
+    # testing the link works) doesn't falsely count as having attended.
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        event = db.get_client_event(conn, event_id, client["id"])
+        if not event:
+            raise HTTPException(404, "you weren't invited to this event")
+        started = bool(event["start_at"]) and datetime.now(timezone.utc) >= event["start_at"]
+        if started:
+            db.mark_attendance(conn, event_id, client["id"], True)
+        return {"ok": True, "marked": started}
     finally:
         conn.close()
 
