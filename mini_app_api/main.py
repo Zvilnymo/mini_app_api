@@ -504,7 +504,14 @@ def list_conferences(authorization: Optional[str] = Header(default=None)):
     try:
         client = _require_client(conn, user)
         rows = db.get_client_events(conn, client["id"])
-        return {"events": [_serialize_event_row(r) for r in rows]}
+        checklist = db.get_client_checklist(conn, client["id"])
+        return {
+            "events": [_serialize_event_row(r) for r in rows],
+            "checklist": [
+                {"type_code": r["type_code"], "title": r["title"], "description": r["description"], "completed": r["completed"]}
+                for r in checklist
+            ],
+        }
     finally:
         conn.close()
 

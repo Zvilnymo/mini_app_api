@@ -481,6 +481,29 @@ def list_event_types(conn, active_only: bool = True):
         return cur.fetchall()
 
 
+def get_client_checklist(conn, client_id: int):
+    """The required conference types + whether this client has attended one
+    of each — the client-facing progress checklist, same idea as
+    documents.checklist_for_client but for event_types.required instead of
+    a file upload."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT t.type_code, t.title, t.description,
+                   EXISTS (
+                       SELECT 1 FROM docbot.events e
+                       JOIN docbot.event_attendance a ON a.event_id = e.event_id
+                       WHERE e.type_code = t.type_code AND a.client_id = %s AND a.attended
+                   ) AS completed
+            FROM docbot.event_types t
+            WHERE t.required
+            ORDER BY t.type_code
+            """,
+            (client_id,),
+        )
+        return cur.fetchall()
+
+
 def get_client_events(conn, client_id: int):
     """Every event this client has been invited to, most recent first,
     each row carrying that client's own rsvp/attendance/feedback state."""
