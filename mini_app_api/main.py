@@ -681,6 +681,7 @@ def admin_get_event(event_id: int, authorization: Optional[str] = Header(default
                     "phone": r["phone"],
                     "rsvp": r["rsvp"],
                     "rsvp_at": r["rsvp_at"].isoformat() if r["rsvp_at"] else None,
+                    "attended": r["attended"],
                 }
                 for r in rsvp_rows
             ],

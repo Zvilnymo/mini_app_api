@@ -680,9 +680,10 @@ def get_event_rsvp_rows(conn, event_id: int):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.client_id, r.rsvp, r.rsvp_at, c.full_name, c.phone, c.telegram_id
+            SELECT r.client_id, r.rsvp, r.rsvp_at, c.full_name, c.phone, c.telegram_id, a.attended
             FROM docbot.event_rsvp r
             JOIN docbot.clients c ON c.id = r.client_id
+            LEFT JOIN docbot.event_attendance a ON a.event_id = r.event_id AND a.client_id = r.client_id
             WHERE r.event_id = %s
             ORDER BY r.invited_at
             """,
