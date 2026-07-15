@@ -46,13 +46,70 @@ def _send_conference_reminders() -> None:
         conn.close()
 
 
+def _send_invoice_issued_reminders() -> None:
+    conn = db.get_connection()
+    try:
+        for inv in db.get_invoices_issued_today_unreminded(conn):
+            amount = f"{float(inv['amount']):,.0f}".replace(",", " ") if inv["amount"] else "—"
+            notifications.notify_client(
+                inv["telegram_id"],
+                f"💳 Нагадуємо: виставлено рахунок «{inv['title'] or 'Рахунок'}» на суму {amount} грн.\n"
+                f"Деталі — в розділі «Кабінет» застосунку.",
+            )
+            db.log_invoice_reminder(conn, inv["client_id"], inv["invoice_id"], "issued")
+    except Exception as e:
+        logger.error(f"Failed to send invoice reminders: {e}")
+    finally:
+        conn.close()
+
+
+def _check_roadmap_stage_changes() -> None:
+    # A client's first check just baselines last_notified_step silently —
+    # otherwise everyone would get a "new stage" ping for their *current*
+    # stage the first time this job ever runs. Only an *increase* in step
+    # counts as progress worth telling them about (a decrease means a data
+    # correction in Bitrix, not something to announce as "просунулась").
+    conn = db.get_connection()
+    try:
+        for client in db.get_registered_clients_for_stage_check(conn):
+            if not client["phone"]:
+                continue
+            contact = db.get_contact_by_phone(conn, db.normalize_phone(client["phone"]))
+            if not contact:
+                continue
+            deal = db.get_deal(conn, contact["id"])
+            pre_court = db.get_pre_court_deal(conn, contact["id"])
+            court = db.get_court_deal(conn, contact["id"])
+            step = stages.compute_step(deal, pre_court, court)
+            last = client["last_notified_step"]
+            if last is not None and step > last:
+                notifications.notify_client(
+                    client["telegram_id"],
+                    f"📈 <b>Ваша справа просунулась</b>\n\nНовий етап: «{stages.STEP_LABELS[step - 1]}».\n"
+                    f"Подробиці — в розділі «Кабінет».",
+                )
+            if step != last:
+                db.set_last_notified_step(conn, client["id"], step)
+    except Exception as e:
+        logger.error(f"Failed to check roadmap stage changes: {e}")
+    finally:
+        conn.close()
+
+
 @app.on_event("startup")
 def _start_scheduler():
     # Mirrors conf_bot's own in-process APScheduler (it has no separate
-    # worker service either) — checks every 5 minutes for 'going' clients
-    # due a 24h or 60m reminder (see db.get_events_needing_reminder).
+    # worker service either).
     scheduler = BackgroundScheduler(timezone="UTC")
+    # Checks every 5 minutes for 'going' clients due a 24h or 60m reminder
+    # (see db.get_events_needing_reminder).
     scheduler.add_job(_send_conference_reminders, "interval", minutes=5, id="conference_reminders")
+    # Invoice-date granularity is a day, so no rush — dedup is via
+    # invoice_reminders_log regardless of how often this runs.
+    scheduler.add_job(_send_invoice_issued_reminders, "interval", minutes=30, id="invoice_issued_reminders")
+    # Heavier (loops every registered client through 3 CRM lookups), and
+    # crm.* only changes as often as etl_zv runs — no need to check often.
+    scheduler.add_job(_check_roadmap_stage_changes, "interval", minutes=30, id="roadmap_stage_changes")
     scheduler.start()
 
 

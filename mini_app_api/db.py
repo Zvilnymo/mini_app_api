@@ -437,6 +437,64 @@ def get_invoices(conn, contact_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Background notification checks (see main.py's scheduler) — both poll
+# crm.* on an interval rather than reacting to a webhook, since etl_zv syncs
+# Bitrix into crm.* on its own schedule and mini_app_api has no push signal
+# for "this changed in Bitrix."
+# ---------------------------------------------------------------------------
+
+def get_invoices_issued_today_unreminded(conn):
+    """Unpaid invoices whose invoice_date is today, for a registered client,
+    that haven't already gotten an 'issued' reminder (see invoice_reminders_log
+    — the same table documents_bot used for its own invoice reminders)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT i.id AS invoice_id, i.title, i.amount, cl.id AS client_id, cl.telegram_id
+            FROM crm.fact_invoices i
+            JOIN crm.dim_contacts dc ON dc.id = i.contact_id
+            JOIN docbot.clients cl
+                ON regexp_replace(cl.phone, '[^0-9]', '', 'g') = regexp_replace(dc.phone, '[^0-9]', '', 'g')
+            WHERE i.invoice_date::date = CURRENT_DATE
+              AND i.stage_id NOT IN %s
+              AND cl.telegram_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM docbot.invoice_reminders_log l
+                  WHERE l.client_id = cl.id AND l.invoice_bitrix_id = i.id::text AND l.reminder_type = 'issued'
+              )
+            """,
+            (PAID_INVOICE_STAGES,),
+        )
+        return cur.fetchall()
+
+
+def log_invoice_reminder(conn, client_id: int, invoice_id, reminder_type: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO docbot.invoice_reminders_log (client_id, invoice_bitrix_id, reminder_type, sent_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            """,
+            (client_id, str(invoice_id), reminder_type),
+        )
+        conn.commit()
+
+
+def get_registered_clients_for_stage_check(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, phone, telegram_id, last_notified_step FROM docbot.clients WHERE telegram_id IS NOT NULL"
+        )
+        return cur.fetchall()
+
+
+def set_last_notified_step(conn, client_id: int, step: int):
+    with conn.cursor() as cur:
+        cur.execute("UPDATE docbot.clients SET last_notified_step = %s WHERE id = %s", (step, client_id))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # docbot.invoice_receipts — tracks "client submitted a receipt, awaiting
 # manager review" per invoice. crm.fact_invoices itself is a read-only ETL
 # mirror of Bitrix (see payments.py) — this local table is what lets the
