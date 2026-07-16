@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ai_document_validator import validator as ai_validator
 
-from . import bitrix, complaints, conferences, db, declaration, documents, notifications, payments, stages
+from . import bitrix, chat, complaints, conferences, db, declaration, documents, notifications, payments, stages
 from .telegram_auth import InvalidInitData, validate_init_data
 
 logger = logging.getLogger(__name__)
@@ -96,10 +96,23 @@ def _check_roadmap_stage_changes() -> None:
         conn.close()
 
 
+def _refresh_faq_embeddings() -> None:
+    conn = db.get_connection()
+    try:
+        chat.ensure_faq_embeddings(conn)
+        chat.reload_faq_cache(conn)
+    except Exception as e:
+        logger.error(f"Failed to refresh FAQ embeddings/cache: {e}")
+    finally:
+        conn.close()
+
+
 @app.on_event("startup")
 def _start_scheduler():
     # Mirrors conf_bot's own in-process APScheduler (it has no separate
     # worker service either).
+    _refresh_faq_embeddings()  # populate the in-process cache before any chat request can arrive
+
     scheduler = BackgroundScheduler(timezone="UTC")
     # Checks every 5 minutes for 'going' clients due a 24h or 60m reminder
     # (see db.get_events_needing_reminder).
@@ -110,6 +123,10 @@ def _start_scheduler():
     # Heavier (loops every registered client through 3 CRM lookups), and
     # crm.* only changes as often as etl_zv runs — no need to check often.
     scheduler.add_job(_check_roadmap_stage_changes, "interval", minutes=30, id="roadmap_stage_changes")
+    # Picks up any new/edited FAQ rows (e.g. added straight in Postgres) and
+    # keeps the in-process cache fresh — cheap since ensure_faq_embeddings
+    # only embeds rows that don't have one yet.
+    scheduler.add_job(_refresh_faq_embeddings, "interval", hours=6, id="faq_embeddings_refresh")
     scheduler.start()
 
 
@@ -496,6 +513,44 @@ def submit_declaration(answers: dict = Body(...), authorization: Optional[str] =
         client = _require_client(conn, user)
         declaration.save_and_submit(conn, client, answers)
         return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.get("/api/chat/messages")
+def list_chat_messages(authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        rows = db.get_chat_history(conn, client["id"], limit=50)
+        return {
+            "messages": [
+                {"role": r["role"], "content": r["content"], "created_at": r["created_at"].isoformat()}
+                for r in rows
+            ]
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/chat/messages")
+def send_chat_message(text: str = Body(..., embed=True), authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    if not text.strip():
+        raise HTTPException(400, "text is required")
+    conn = db.get_connection()
+    try:
+        client = _require_client(conn, user)
+        ctx = _load_case_context(conn, client["phone"])
+        case = payments = None
+        days_active = None
+        if ctx:
+            case, payments, _debt_overview, days_active = _case_and_payments(conn, ctx, client["id"])
+        result = chat.handle_message(
+            conn, client=client, case=case, payments=payments, days_active=days_active, user_message=text.strip(),
+        )
+        return result
     finally:
         conn.close()
 

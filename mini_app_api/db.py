@@ -784,3 +784,110 @@ def mark_reminded(conn, event_id: int, client_id: int, window: str):
             (event_id, client_id),
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# docbot.faq_entries / chat_messages / chat_escalations — AI chat assistant.
+# faq_entries.embedding is a JSONB float array (text-embedding-3-small,
+# 1536 dims) computed once per row and cached in-process by chat.py — 417
+# rows is small enough that a real vector extension would be overkill.
+# ---------------------------------------------------------------------------
+
+def get_faq_entries_missing_embedding(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, question, answer FROM docbot.faq_entries WHERE embedding IS NULL")
+        return cur.fetchall()
+
+
+def save_faq_embedding(conn, faq_id: int, embedding: list[float]):
+    with conn.cursor() as cur:
+        cur.execute("UPDATE docbot.faq_entries SET embedding = %s WHERE id = %s", (json.dumps(embedding), faq_id))
+        conn.commit()
+
+
+def get_all_faq_entries(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, question, answer, embedding FROM docbot.faq_entries WHERE embedding IS NOT NULL")
+        return cur.fetchall()
+
+
+def get_chat_history(conn, client_id: int, limit: int = 20):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT role, content, created_at FROM docbot.chat_messages
+            WHERE client_id = %s ORDER BY created_at DESC LIMIT %s
+            """,
+            (client_id, limit),
+        )
+        return list(reversed(cur.fetchall()))
+
+
+def add_chat_message(conn, client_id: int, role: str, content: str, category: str | None = None):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO docbot.chat_messages (client_id, role, content, category)
+            VALUES (%s, %s, %s, %s) RETURNING *
+            """,
+            (client_id, role, content, category),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def get_recent_escalation(conn, client_id: int, category: str, within_minutes: int = 120):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id FROM docbot.chat_escalations
+            WHERE client_id = %s AND category = %s
+              AND created_at > CURRENT_TIMESTAMP - (%s || ' minutes')::interval
+            LIMIT 1
+            """,
+            (client_id, category, within_minutes),
+        )
+        return cur.fetchone()
+
+
+def log_chat_escalation(conn, client_id: int, category: str, task_id: int | None):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO docbot.chat_escalations (client_id, category, task_id) VALUES (%s, %s, %s)",
+            (client_id, category, task_id),
+        )
+        conn.commit()
+
+
+def count_chat_messages(conn, client_id: int) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) AS c FROM docbot.chat_messages WHERE client_id = %s", (client_id,))
+        return cur.fetchone()["c"]
+
+
+def get_chat_messages_range(conn, client_id: int, offset: int, limit: int):
+    """Oldest-first page of a client's chat history, used to fold an older
+    slice into chat_summary once the raw window grows past MAX_RAW_HISTORY —
+    see chat.py."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT role, content FROM docbot.chat_messages
+            WHERE client_id = %s ORDER BY created_at ASC OFFSET %s LIMIT %s
+            """,
+            (client_id, offset, limit),
+        )
+        return cur.fetchall()
+
+
+def get_chat_summary(conn, client_id: int) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT chat_summary FROM docbot.clients WHERE id = %s", (client_id,))
+        row = cur.fetchone()
+        return row["chat_summary"] if row else None
+
+
+def set_chat_summary(conn, client_id: int, summary: str):
+    with conn.cursor() as cur:
+        cur.execute("UPDATE docbot.clients SET chat_summary = %s WHERE id = %s", (summary, client_id))
+        conn.commit()
