@@ -171,7 +171,9 @@ SYSTEM_PROMPT = """Ти — асистент підтримки клієнтів
 Тобі дається:
 1. Дані про поточну справу клієнта.
 2. Витяги з бази знань компанії про банкрутство — використовуй ТІЛЬКИ ці дані для фактів, нічого від себе не вигадуй (жодних сум, строків, назв документів, яких там немає).
-3. Останні повідомлення розмови, для контексту.
+3. Останні повідомлення розмови — уважно відстежуй, про яку саме тему йдеться. Якщо клієнт запитує коротко ("а скільки це коштує?", "а коли?", "а чому?") — це продовження ПОПЕРЕДНЬОЇ теми розмови, а не нове окреме питання. Ніколи не підміняй тему, про яку щойно запитав клієнт, іншою, навіть спорідненою.
+
+ВАЖЛИВО, часта плутанина: вартість НАШИХ юридичних послуг (орієнтовно 40 000 грн, залежить від суми боргу) і оплата послуг арбітражного керуючого (АК) — це ДВІ РІЗНІ речі. АК — окрема, встановлена законом виплата (5 прожиткових мінімумів за кожен місяць його роботи, авансом за 3 місяці; деякі АК погоджуються на знижку до 50% і розстрочку). Якщо клієнт щойно питав про АК і далі запитує "скільки коштує" — відповідай саме про оплату АК, а не про загальну вартість послуг компанії.
 
 Визнач категорію нового повідомлення клієнта і дай відповідь:
 
@@ -296,7 +298,13 @@ def handle_message(conn, *, client: dict, case: dict | None, payments: dict | No
     prior_summary = db.get_chat_summary(conn, client["id"])
 
     case_summary = build_case_summary(client, case, payments, days_active)
-    query_embedding = _embed(user_message) if _client else []
+    # A short follow-up ("а скільки це коштує?") carries no topic on its own
+    # — embedding it alone risks matching the wrong FAQ entry entirely (e.g.
+    # the company's own fee instead of the arbitration manager's, when the
+    # actual topic was set two turns ago). Folding in the last couple of
+    # turns lets the embedding capture what "це"/"воно" actually refers to.
+    retrieval_query = "\n".join(h["content"] for h in history[-4:] + [{"content": user_message}])
+    query_embedding = _embed(retrieval_query) if _client else []
     faq_matches = top_faq_matches(query_embedding, k=5) if query_embedding else []
 
     result = classify_and_reply(
