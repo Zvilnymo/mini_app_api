@@ -1,42 +1,54 @@
 """
 AI chat assistant — client-facing, persistent, available any time of day.
 
+Мозок чату — модуль `support_agent` (ТЗ Олега 23.07.2026): три скіли
+(юрист + психолог + гуморист), проактивний тон замість «закритих» відповідей і
+детермінований триаж «фільтр мусору». Уся обвʼязка, що вже працювала, лишилась
+без змін: збереження кожного повідомлення в `docbot.chat_messages`, згортка
+старої історії в `docbot.clients.chat_summary`, пошук по базі знань компанії
+(`docbot.faq_entries`, 440 вивірених Q&A з ембеддингами) і ескалація задачею в
+Бітрікс.
+
 Grounded on two sources, both provided fresh on every message rather than
-baked into a fine-tune: the company's own FAQ knowledge base
-(docbot.faq_entries, ~417 real vetted Q&A pairs) via embedding similarity
-search, and the client's live case data (same case/payments shape /api/me
-already computes) passed in by main.py.
+baked into a fine-tune: the company's own FAQ knowledge base via embedding
+similarity search, and the client's live case data (same case/payments shape
+/api/me already computes) passed in by main.py.
 
-One OpenAI call per message classifies AND answers in one shot (JSON
-response format, not a separate classification pass, not tool-calling) —
-simpler to reason about and one round-trip instead of two:
-  - case_status  — question about the client's own case; answered from the
-                    case summary passed in.
-  - faq          — general bankruptcy/debt/collector question; answered
-                    from the retrieved FAQ snippets, nothing invented.
-  - off_topic    — unrelated to bankruptcy/debt/the case (job hunting,
-                    military registration, etc.) — the model's own reply is
-                    discarded and replaced with a fixed message below, so
-                    there is no chance of it improvising an answer anyway.
-  - emotional    — distress, shame, family conflict — warm supportive tone,
-                    no legal specifics, always escalated.
-  - uncertain    — no good FAQ match; honest "I'll check and get back to
-                    you" rather than a guess.
+Порядок рішення на кожне повідомлення:
 
-off_topic/emotional/uncertain all escalate: a Bitrix task lands on the
-person at .../personal/user/2627/, with .../personal/user/594/ (Тетяна
-Ніконова, already the support-department responsible elsewhere — see
-complaints.py) in copy. Escalations are rate-limited per client+category
-(see db.get_recent_escalation) so a client venting for ten messages in a
-row doesn't create ten tasks.
+  1. ДЕТЕРМІНОВАНИЙ ПРЕ-ТРИАЖ (`support_agent.pretriage`) — без мережі, до LLM.
+     Спрацьовує лише на двох класах, де не можна залежати від моделі:
+       • "distress"  — розпач/криза: відповідь із контактом штатного психолога
+                       формується локально й гарантовано, + ескалація (вікно 30 хв);
+       • "complaint" — гнів/претензія/загроза («це розвод, поверніть гроші»):
+                       бот не сперечається, віддає живій людині. Раніше такі
+                       повідомлення не ескалювались узагалі — падали в faq.
+     Решта — None, відповідає LLM.
 
-Every message is permanently stored in docbot.chat_messages (nothing is
-ever deleted) — but sending the *entire* history to OpenAI on every turn
-would get slower and more expensive as a conversation grows over months.
-Instead the model always sees the last MAX_RAW_HISTORY messages verbatim
-plus a running summary (docbot.clients.chat_summary) of everything older,
-folded in a few sentences at a time as the conversation outgrows the
-window — so context is never silently lost, just compressed.
+  2. LLM (один виклик: класифікація + відповідь у JSON) за системним промптом
+     із трьох скілів. Категорії ті самі, що й були:
+       - case_status — питання про власну справу; з case summary;
+       - faq         — загальне питання; з витягів бази знань, нічого від себе;
+       - off_topic   — поза темою: відповідь моделі відкидається, ставиться фікс;
+       - emotional   — тривога/сором/конфлікт: тепло, без юридичних деталей;
+       - uncertain   — справді немає даних: чесно передаємо юристу.
+
+  3. АНТИ-«ЗАКРИТА ВІДПОВІДЬ» (`support_agent.is_closed_reply`) — пост-перевірка.
+     «Так», «добре», «.», «дайте мені трохи часу — уточню» замінюються
+     проактивним варіантом (емпатія → суть → наступний крок → підтримка).
+     Це пряма вимога ТЗ: у корпусі 1236 діалогів такі відповіді — топ-1.
+
+off_topic/emotional/uncertain/distress/complaint ескалюються: задача в Бітрікс
+на .../personal/user/2627/, у копії .../personal/user/594/ (Тетяна Ніконова —
+та сама, що й у complaints.py). Ескалації обмежені по клієнту+категорії
+(db.get_recent_escalation), щоб десять повідомлень поспіль не створили десять
+задач; для кризи вікно коротше (30 хв).
+
+Провайдер LLM перемикається змінною середовища CHAT_LLM_PROVIDER:
+"openai" (за замовчуванням — те, що вже налаштоване й оплачене на Render) або
+"anthropic" (потрібен ANTHROPIC_API_KEY і пакет `anthropic` у requirements).
+Ембеддинги бази знань у будь-якому разі рахує OpenAI — вони вже пораховані для
+всіх 440 записів, міняти їх провайдера немає причин.
 """
 from __future__ import annotations
 
@@ -47,7 +59,7 @@ import os
 
 from openai import OpenAI
 
-from . import bitrix, db
+from . import bitrix, db, support_agent
 
 logger = logging.getLogger(__name__)
 
@@ -57,22 +69,32 @@ _client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
+# Провайдер відповіді. За замовчуванням лишається OpenAI — деплой без змін.
+CHAT_LLM_PROVIDER = os.getenv("CHAT_LLM_PROVIDER", "openai").strip().lower()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
+
 # Same two people every complaint already CCs (see complaints.py) — 2627 is
 # new, specific to AI-chat escalations, confirmed via their Bitrix profile
 # URL (.../personal/user/2627/).
 ESCALATION_RESPONSIBLE_ID = 2627
 ESCALATION_CC_IDS = [594]
 
-OFF_TOPIC_REPLY = (
-    "Це питання не стосується Вашої справи про банкрутство, тож, на жаль, я не зможу з ним допомогти. "
-    "Я передам його менеджеру — він зв'яжеться з Вами найближчим часом."
-)
+OFF_TOPIC_REPLY = support_agent.proactive_fallback(support_agent.CATEGORY_OFF_TOPIC)
 
 CATEGORY_LABELS = {
     "off_topic": "Питання поза темою банкрутства",
     "emotional": "Клієнту потрібна підтримка",
     "uncertain": "AI не знайшов відповіді у базі знань",
+    # Нові класи з детермінованого пре-триажу — саме вони найважливіші для людини.
+    support_agent.CATEGORY_DISTRESS: "🚨 КРИЗОВИЙ СТАН КЛІЄНТА — потрібна жива людина",
+    support_agent.CATEGORY_COMPLAINT: "⚠️ Претензія/недовіра клієнта — потрібен керівник",
+    # AI сказав клієнту «передам юристу» — значить, задача має реально зʼявитись.
+    "promised_handoff": "AI пообіцяв клієнту передати питання спеціалісту",
 }
+
+# Категорія, під якою ескалюємо обіцянку передати питання людині.
+PROMISED_HANDOFF = "promised_handoff"
 
 # How many most-recent messages stay verbatim in every prompt. Once the
 # conversation has grown MAX_RAW_HISTORY + SUMMARY_TRIGGER_SLACK messages,
@@ -80,6 +102,8 @@ CATEGORY_LABELS = {
 # re-summarizing on every single new message once past the window.
 MAX_RAW_HISTORY = 24
 SUMMARY_TRIGGER_SLACK = 10
+
+VALID_CATEGORIES = ("case_status", "faq", "off_topic", "emotional", "uncertain")
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +144,7 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 # In-process cache — reloaded on startup and by the same periodic scheduler
-# that reruns ensure_faq_embeddings, not on every request (417 rows loaded
+# that reruns ensure_faq_embeddings, not on every request (440 rows loaded
 # fresh every message would be wasteful for data that rarely changes).
 _faq_cache: list[dict] | None = None
 
@@ -166,40 +190,57 @@ def build_case_summary(client: dict, case: dict | None, payments: dict | None, d
 # Classification + reply
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """Ти — асистент підтримки клієнтів юридичної компанії "Звільнимо", яка супроводжує людей у процедурі банкрутства фізичних осіб в Україні. Спілкуйся тепло, просто, по-людськи, короткими зрозумілими реченнями, без канцеляризмів.
+# Три скіли + проактивний тон + доменні уточнення застосунку + JSON-контракт.
+SYSTEM_PROMPT = support_agent.build_system_prompt()
 
-Звертайся до клієнта офіційно, на "Ви" (займенник "Ви"/"Вам"/"Вас" — завжди з великої літери), за іменем і прізвищем (з даних про справу, поле "Ім'я клієнта"). Використовуй ім'я й прізвище в привітанні та коли це природно звучить у відповіді — не встав його в кожне речення. Ніколи не переходь на "ти".
 
-Тобі дається:
-1. Дані про поточну справу клієнта.
-2. Витяги з бази знань компанії про банкрутство — використовуй ТІЛЬКИ ці дані для фактів, нічого від себе не вигадуй (жодних сум, строків, назв документів, яких там немає).
-3. Останні повідомлення розмови — уважно відстежуй, про яку саме тему йдеться. Якщо клієнт запитує коротко ("а скільки це коштує?", "а коли?", "а чому?") — це продовження ПОПЕРЕДНЬОЇ теми розмови, а не нове окреме питання. Ніколи не підміняй тему, про яку щойно запитав клієнт, іншою, навіть спорідненою.
+def _call_anthropic(messages: list[dict]) -> str | None:
+    """Claude замість OpenAI, якщо CHAT_LLM_PROVIDER=anthropic. None при будь-якій
+    проблемі — викликач тоді відкотиться на OpenAI/офлайн, чат не падає."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    try:
+        import anthropic
+    except ImportError:
+        logger.warning("CHAT_LLM_PROVIDER=anthropic, але пакет `anthropic` не встановлено")
+        return None
+    # Anthropic бере system окремо і не приймає роль "system" у messages.
+    system_blocks = [m["content"] for m in messages if m["role"] == "system"]
+    convo = [m for m in messages if m["role"] in ("user", "assistant")]
+    # ⚠️ temperature НЕ передаємо: новіші моделі Claude (opus-4-8 і далі) його
+    # вже не приймають і відповідають 400. Перевірено наживо 26.07.2026.
+    try:
+        resp = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY).messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=1200,
+            system="\n\n".join(system_blocks),
+            messages=convo,
+        )
+    except Exception as e:
+        logger.error(f"Anthropic call failed: {e}")
+        return None
+    return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip() or None
 
-ВАЖЛИВО, часта плутанина: вартість НАШИХ юридичних послуг (орієнтовно 40 000 грн, залежить від суми боргу) і оплата послуг арбітражного керуючого (АК) — це ДВІ РІЗНІ речі. АК — окрема, встановлена законом виплата (5 прожиткових мінімумів за кожен місяць його роботи, авансом за 3 місяці; деякі АК погоджуються на знижку до 50% і розстрочку). Якщо клієнт щойно питав про АК і далі запитує "скільки коштує" — відповідай саме про оплату АК, а не про загальну вартість послуг компанії.
 
-Категорія потрібна лише для того, щоб вирішити, чи передавати розмову менеджеру — вона НЕ обмежує, якими джерелами користуватись для відповіді. Для "case_status" і "faq" завжди використовуй ОБИДВА джерела разом, якщо це доречно: наприклад, "скільки триватиме МОЯ справа" — скажи поточний етап з даних про справу І типовий термін з бази знань, а не тільки щось одне.
-
-НІКОЛИ не давай порожніх відповідей-відмовок на кшталт "я уточню" чи "дам знати пізніше", якщо в наданих матеріалах (дані про справу + база знань) є хоч якась релевантна інформація — завжди спочатку спробуй відповісти по суті з того, що є. Категорія "uncertain" — це справді крайній випадок, коли І дані про справу, І база знань не містять нічого по темі питання.
-
-Якщо нове повідомлення клієнта коротке або схоже на реакцію на ТВОЮ попередню відповідь (наприклад "у кого?", "що?", "не зрозумів", "де?") — це прохання уточнити саме ТВОЮ попередню відповідь, а не нове окреме питання. У такому разі поясни точніше або дай конкретнішу відповідь — ніколи не повторюй ту саму фразу майже дослівно.
-
-Визнач категорію нового повідомлення клієнта і дай відповідь:
-
-- "case_status" — питання про стан ЙОГО справи (етап, оплати, документи, наступні кроки, терміни).
-- "faq" — загальне питання про банкрутство/борги/колекторів/арбітражного керуючого/суд.
-- "off_topic" — питання, що НЕ стосується банкрутства, боргів чи справи клієнта (робота, мобілізація/бронь, особисті теми, будь-що стороннє). Не намагайся відповісти по суті.
-- "emotional" — клієнт демонструє тривогу, страх, сором, вигорання, конфлікт з рідними. Відповідай тепло і підтримуюче, без юридичних деталей.
-- "uncertain" — і дані про справу, і база знань справді не містять нічого релевантного по темі питання.
-
-Поверни ЛИШЕ JSON без жодного тексту навколо: {"category": "case_status|faq|off_topic|emotional|uncertain", "reply": "..."}"""
+def _call_openai(messages: list[dict]) -> str | None:
+    if _client is None:
+        return None
+    try:
+        response = _client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.4,
+        )
+    except Exception as e:
+        logger.error(f"OpenAI call failed: {e}")
+        return None
+    return response.choices[0].message.content
 
 
 def classify_and_reply(
     *, case_summary: str, faq_matches: list[dict], history: list[dict], user_message: str, prior_summary: str | None = None,
 ) -> dict:
-    if _client is None:
-        return {"category": "uncertain", "reply": "Наразі не можу відповісти — спробуйте, будь ласка, трохи пізніше."}
-
     faq_block = "\n\n".join(f"Q: {m['question']}\nA: {m['answer']}" for m in faq_matches) or "(немає релевантних записів)"
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -213,26 +254,40 @@ def classify_and_reply(
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": user_message})
 
-    response = _client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        response_format={"type": "json_object"},
-        temperature=0.4,
-    )
+    raw = _call_anthropic(messages) if CHAT_LLM_PROVIDER == "anthropic" else None
+    if raw is None:
+        raw = _call_openai(messages)
+
+    if raw is None:
+        # Жодна модель не відповіла — не заглушка, а проактивна заготовка.
+        category, reply = support_agent.offline_reply(user_message)
+        return {"category": category, "reply": reply}
+
     try:
-        parsed = json.loads(response.choices[0].message.content)
+        parsed = json.loads(raw)
         category = parsed.get("category", "uncertain")
-        reply = parsed.get("reply", "").strip()
-    except (json.JSONDecodeError, AttributeError):
+        reply = (parsed.get("reply") or "").strip()
+    except (json.JSONDecodeError, AttributeError, TypeError):
         category, reply = "uncertain", ""
 
-    if category not in ("case_status", "faq", "off_topic", "emotional", "uncertain"):
+    if category not in VALID_CATEGORIES:
         category = "uncertain"
-    if category == "off_topic" or not reply:
-        # Never trust the model's own wording for off_topic (or an empty
-        # reply for any category) — a fixed message guarantees it can't
-        # improvise an answer it was told not to give.
-        reply = OFF_TOPIC_REPLY if category == "off_topic" else "Дайте мені трохи часу — уточню це і повернуся з відповіддю до Вас."
+
+    # Проста подяка/привітання — це НЕ емоційна криза. Без цієї перевірки кожне
+    # «дякую вам велике» створювало б задачу підтримці (спіймано в живому
+    # прогоні 26.07: модель віддала category="emotional").
+    if category == "emotional" and support_agent.is_pure_courtesy(user_message):
+        category = "faq"
+
+    # Never trust the model's own wording for off_topic — a fixed message
+    # guarantees it can't improvise an answer it was told not to give.
+    if category == "off_topic":
+        reply = OFF_TOPIC_REPLY
+    elif support_agent.is_closed_reply(reply):
+        # Головна вимога ТЗ: «закрита» відповідь («так», «добре», «я уточню і
+        # повернусь») — це те, на що скаржиться власник. Замінюємо проактивною.
+        logger.info(f"Closed reply replaced (category={category}): {reply!r}")
+        reply = support_agent.proactive_fallback(category)
 
     return {"category": category, "reply": reply}
 
@@ -244,7 +299,8 @@ def classify_and_reply(
 def escalate_if_needed(conn, *, client: dict, category: str, user_message: str) -> None:
     if category not in CATEGORY_LABELS:
         return
-    if db.get_recent_escalation(conn, client["id"], category):
+    window = support_agent.escalation_window_minutes(category)
+    if db.get_recent_escalation(conn, client["id"], category, window):
         # Already escalated this category recently — don't spam a new
         # Bitrix task for every message of the same kind in a row.
         return
@@ -300,6 +356,17 @@ def _fold_older_history_into_summary(conn, client_id: int) -> None:
 
 def handle_message(conn, *, client: dict, case: dict | None, payments: dict | None, days_active: int | None, user_message: str) -> dict:
     db.add_chat_message(conn, client["id"], "user", user_message)
+
+    # 1. Детермінований запобіжник ДО будь-якої мережі. Криза й претензія не
+    #    можуть залежати від того, чи жива зараз модель. Згортку історії тут
+    #    свідомо пропускаємо — вона зробиться на наступному звичайному
+    #    повідомленні, а кризова відповідь має піти без зайвої затримки.
+    forced = support_agent.pretriage(user_message, case_known=bool(case))
+    if forced:
+        db.add_chat_message(conn, client["id"], "assistant", forced["reply"], category=forced["category"])
+        escalate_if_needed(conn, client=client, category=forced["category"], user_message=user_message)
+        return {"category": forced["category"], "reply": forced["reply"]}
+
     _fold_older_history_into_summary(conn, client["id"])
 
     history = [{"role": h["role"], "content": h["content"]} for h in db.get_chat_history(conn, client["id"], limit=MAX_RAW_HISTORY)][:-1]
@@ -321,6 +388,12 @@ def handle_message(conn, *, client: dict, case: dict | None, payments: dict | No
     )
 
     db.add_chat_message(conn, client["id"], "assistant", result["reply"], category=result["category"])
-    escalate_if_needed(conn, client=client, category=result["category"], user_message=user_message)
+
+    # Якщо модель пообіцяла клієнту «передам юристу», а сама категорія не
+    # ескалюється — все одно створюємо задачу. Інакше обіцянка була б порожньою.
+    escalation_category = result["category"]
+    if escalation_category not in CATEGORY_LABELS and support_agent.promises_handoff(result["reply"]):
+        escalation_category = PROMISED_HANDOFF
+    escalate_if_needed(conn, client=client, category=escalation_category, user_message=user_message)
 
     return result
