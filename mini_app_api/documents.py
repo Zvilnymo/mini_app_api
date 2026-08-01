@@ -15,6 +15,7 @@ from __future__ import annotations
 import mimetypes
 import os
 import tempfile
+import time
 from io import BytesIO
 
 from PIL import Image, UnidentifiedImageError
@@ -136,17 +137,22 @@ def upload_document(conn, client: dict, document_type: str, filename: str, conte
     # this null — null renders no status badge at all, which reads as "the
     # upload silently did nothing" even though the file made it to Drive.
     validation_status = "pending"
+    duration_ms = None
     if not meta.get("skip_ai_validation"):
         suffix = os.path.splitext(filename)[1] or ""
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
+        started = time.monotonic()
         try:
             result = ai_validator.validate_document(tmp_path, document_type)
         finally:
             os.unlink(tmp_path)
+        duration_ms = int((time.monotonic() - started) * 1000)
         if result is not None:
             validation_status = result.status
+
+    db.log_document_upload_result(conn, client["id"], document_type, validation_status, duration_ms)
 
     uploaded = disk.upload_bytes(content, filename, subfolder["id"], mimetype)
 
@@ -222,4 +228,5 @@ def upload_text_document(conn, client: dict, document_type: str, text: str) -> d
             file_size=int(uploaded.get("size", len(content))),
             validation_status="pending",
         )
+    db.log_document_upload_result(conn, client["id"], document_type, "pending", None)
     return {"document": row, "validation_status": "pending"}

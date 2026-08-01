@@ -88,6 +88,22 @@ class PhoneAlreadyLinked(Exception):
     """Raised when the phone being registered already belongs to a different telegram_id."""
 
 
+def ensure_onboarding_channel_column(conn) -> None:
+    """Additive-only. Distinguishes clients who started in documents_bot's
+    own conversation flow ('bot') from ones who started directly in the
+    mini app ('mini_app') — the bot's /start uses this to keep showing
+    existing clients their familiar menu while routing brand-new people to
+    the mini app instead. Defaulting to 'bot' means every row that already
+    existed before this column shipped is automatically treated as a
+    legacy bot client, with no backfill needed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE docbot.clients ADD COLUMN IF NOT EXISTS "
+            "onboarding_channel TEXT NOT NULL DEFAULT 'bot'"
+        )
+        conn.commit()
+
+
 def create_client(conn, telegram_id: int, full_name: str, phone: str):
     phone = normalize_phone(phone)
     with conn.cursor() as cur:
@@ -107,10 +123,15 @@ def create_client(conn, telegram_id: int, full_name: str, phone: str):
         if existing and existing["telegram_id"] != telegram_id:
             raise PhoneAlreadyLinked(phone)
 
+        # onboarding_channel is deliberately absent from the ON CONFLICT
+        # SET clause: a client who first registered via the bot and later
+        # also opens the mini app must keep 'bot' so /start keeps routing
+        # them to their familiar menu, not flip to 'mini_app' just because
+        # this ran once.
         cur.execute(
             """
-            INSERT INTO docbot.clients (telegram_id, full_name, phone)
-            VALUES (%s, %s, %s)
+            INSERT INTO docbot.clients (telegram_id, full_name, phone, onboarding_channel)
+            VALUES (%s, %s, %s, 'mini_app')
             ON CONFLICT (telegram_id) DO UPDATE
             SET full_name = EXCLUDED.full_name,
                 phone = EXCLUDED.phone,
@@ -1070,4 +1091,175 @@ def get_chat_summary(conn, client_id: int) -> str | None:
 def set_chat_summary(conn, client_id: int, summary: str):
     with conn.cursor() as cur:
         cur.execute("UPDATE docbot.clients SET chat_summary = %s WHERE id = %s", (summary, client_id))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# mini_app_analytics.* — client touchpoint tracking, one normalized table
+# per event kind (not a single jsonb event log) so it's directly queryable/
+# joinable in SQL without unpacking JSON first. Two kinds (screen_views,
+# document_upload_attempts) have no natural backend touchpoint and are
+# logged from a dedicated /api/analytics/track call the frontend fires;
+# everything else is logged inline from the endpoint that already knows it
+# happened server-side (more reliable than trusting the frontend to also
+# report it, and one less network call).
+# ---------------------------------------------------------------------------
+
+def ensure_analytics_schema(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA IF NOT EXISTS mini_app_analytics")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mini_app_analytics.screen_views (
+                id BIGSERIAL PRIMARY KEY,
+                client_id INT REFERENCES docbot.clients(id),
+                telegram_id BIGINT NOT NULL,
+                screen TEXT NOT NULL,
+                viewed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS screen_views_client_idx ON mini_app_analytics.screen_views (client_id, viewed_at)"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mini_app_analytics.document_upload_attempts (
+                id BIGSERIAL PRIMARY KEY,
+                client_id INT NOT NULL REFERENCES docbot.clients(id),
+                document_type TEXT NOT NULL,
+                method TEXT NOT NULL,
+                attempted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS doc_upload_attempts_client_idx "
+            "ON mini_app_analytics.document_upload_attempts (client_id, document_type, attempted_at)"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mini_app_analytics.document_upload_results (
+                id BIGSERIAL PRIMARY KEY,
+                client_id INT NOT NULL REFERENCES docbot.clients(id),
+                document_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                duration_ms INT,
+                resulted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS doc_upload_results_client_idx "
+            "ON mini_app_analytics.document_upload_results (client_id, document_type, resulted_at)"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mini_app_analytics.client_registrations (
+                id BIGSERIAL PRIMARY KEY,
+                client_id INT NOT NULL REFERENCES docbot.clients(id),
+                telegram_id BIGINT NOT NULL,
+                registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mini_app_analytics.screening_completions (
+                id BIGSERIAL PRIMARY KEY,
+                client_id INT NOT NULL REFERENCES docbot.clients(id),
+                completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mini_app_analytics.conference_rsvp_events (
+                id BIGSERIAL PRIMARY KEY,
+                client_id INT NOT NULL REFERENCES docbot.clients(id),
+                event_id INT NOT NULL REFERENCES docbot.events(event_id),
+                rsvp TEXT NOT NULL,
+                responded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mini_app_analytics.declaration_submissions (
+                id BIGSERIAL PRIMARY KEY,
+                client_id INT NOT NULL REFERENCES docbot.clients(id),
+                answered_required INT NOT NULL,
+                total_required INT NOT NULL,
+                completed BOOLEAN NOT NULL,
+                submitted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.commit()
+
+
+def log_screen_view(conn, client_id: int | None, telegram_id: int, screen: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO mini_app_analytics.screen_views (client_id, telegram_id, screen) VALUES (%s, %s, %s)",
+            (client_id, telegram_id, screen),
+        )
+        conn.commit()
+
+
+def log_document_upload_attempt(conn, client_id: int, document_type: str, method: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO mini_app_analytics.document_upload_attempts (client_id, document_type, method) VALUES (%s, %s, %s)",
+            (client_id, document_type, method),
+        )
+        conn.commit()
+
+
+def log_document_upload_result(conn, client_id: int, document_type: str, status: str, duration_ms: int | None):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO mini_app_analytics.document_upload_results (client_id, document_type, status, duration_ms)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (client_id, document_type, status, duration_ms),
+        )
+        conn.commit()
+
+
+def log_client_registration(conn, client_id: int, telegram_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO mini_app_analytics.client_registrations (client_id, telegram_id) VALUES (%s, %s)",
+            (client_id, telegram_id),
+        )
+        conn.commit()
+
+
+def log_screening_completion(conn, client_id: int):
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO mini_app_analytics.screening_completions (client_id) VALUES (%s)", (client_id,))
+        conn.commit()
+
+
+def log_conference_rsvp_event(conn, client_id: int, event_id: int, rsvp: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO mini_app_analytics.conference_rsvp_events (client_id, event_id, rsvp) VALUES (%s, %s, %s)",
+            (client_id, event_id, rsvp),
+        )
+        conn.commit()
+
+
+def log_declaration_submission(conn, client_id: int, answered_required: int, total_required: int, completed: bool):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO mini_app_analytics.declaration_submissions
+            (client_id, answered_required, total_required, completed)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (client_id, answered_required, total_required, completed),
+        )
         conn.commit()

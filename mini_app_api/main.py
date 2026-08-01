@@ -114,6 +114,8 @@ def _start_scheduler():
     conn = db.get_connection()
     try:
         db.ensure_conferences_schema(conn)
+        db.ensure_onboarding_channel_column(conn)
+        db.ensure_analytics_schema(conn)
     finally:
         conn.close()
 
@@ -308,6 +310,7 @@ def submit_screening(
             has_sold_property=has_sold_property,
             income_over_30k=income_over_30k,
         )
+        db.log_screening_completion(conn, client["id"])
         return {"ok": True}
     finally:
         conn.close()
@@ -403,6 +406,12 @@ def register(phone: str = Form(...), authorization: Optional[str] = Header(defau
     user = authenticate(authorization)
     conn = db.get_connection()
     try:
+        # Checked before create_client's upsert so we can tell a genuinely
+        # first-time registration (worth logging for the funnel) apart from
+        # an existing client re-sharing their phone (would otherwise log a
+        # second "registered_at" for the same person every time).
+        is_new = db.get_client_by_telegram_id(conn, user["id"]) is None
+
         # Prefer the CRM's name for the entered phone over the Telegram
         # display name — falls back to Telegram name if there's no CRM
         # contact yet (e.g. brand-new lead not synced by etl_zv yet).
@@ -421,6 +430,8 @@ def register(phone: str = Form(...), authorization: Optional[str] = Header(defau
                 "Цей номер телефону вже прив'язано до іншого Telegram-акаунта. "
                 "Увійдіть у застосунок з того акаунта або зверніться до адміністратора.",
             )
+        if is_new:
+            db.log_client_registration(conn, client["id"], user["id"])
         return {"registered": True, "client": {"id": client["id"], "full_name": client["full_name"], "phone": client["phone"]}}
     finally:
         conn.close()
@@ -518,6 +529,9 @@ def submit_declaration(answers: dict = Body(...), authorization: Optional[str] =
     try:
         client = _require_client(conn, user)
         declaration.save_and_submit(conn, client, answers)
+        required_keys = [q["key"] for q in declaration.QUESTIONS if q["required"]]
+        answered_required = sum(1 for k in required_keys if (answers.get(k) or "").strip())
+        db.log_declaration_submission(conn, client["id"], answered_required, len(required_keys), True)
         return {"ok": True}
     finally:
         conn.close()
@@ -591,6 +605,42 @@ def upload_text_document(
 
 
 # ---------------------------------------------------------------------------
+# mini_app_analytics — the two event kinds with no natural backend
+# touchpoint (everything else is logged inline where it already happens
+# server-side, see db.py's mini_app_analytics section). Never lets a
+# tracking failure surface to the client — this is instrumentation, not a
+# feature the app depends on.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/analytics/track")
+def track_event(event: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    kind = event.get("kind")
+    conn = db.get_connection()
+    try:
+        client = db.get_client_by_telegram_id(conn, user["id"])
+        client_id = client["id"] if client else None
+        if kind == "screen_view":
+            screen = event.get("screen")
+            if not screen:
+                raise HTTPException(400, "screen is required")
+            db.log_screen_view(conn, client_id, user["id"], screen)
+        elif kind == "document_upload_attempt":
+            if client_id is None:
+                raise HTTPException(404, "client not registered yet")
+            document_type = event.get("document_type")
+            method = event.get("method", "file")
+            if not document_type:
+                raise HTTPException(400, "document_type is required")
+            db.log_document_upload_attempt(conn, client_id, document_type, method)
+        else:
+            raise HTTPException(400, f"unknown event kind: {kind}")
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Зустрічі (conferences) — client-facing: view invitations, RSVP, leave
 # feedback after a meeting. See conferences.py's module docstring for why
 # this is all in-app rather than Telegram inline-keyboard callbacks.
@@ -646,6 +696,7 @@ def submit_conference_rsvp(event_id: int, rsvp: str = Body(..., embed=True), aut
         if not event:
             raise HTTPException(404, "you weren't invited to this event")
         db.submit_rsvp(conn, event_id, client["id"], rsvp)
+        db.log_conference_rsvp_event(conn, client["id"], event_id, rsvp)
         conferences.notify_admins_new_rsvp(conn, client_name=client["full_name"], event_title=event["title"], rsvp=rsvp)
         return {"ok": True}
     finally:
