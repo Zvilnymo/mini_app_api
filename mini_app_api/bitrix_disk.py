@@ -82,25 +82,37 @@ class BitrixDiskManager:
                 return item
         return None
 
+    def _find_or_create(self, parent_id, name: str) -> dict:
+        existing = self._find_child_by_name(parent_id, name)
+        if existing:
+            return {"id": existing["ID"], "webViewLink": existing.get("DETAIL_URL")}
+        try:
+            result = bitrix._post("disk.folder.addsubfolder", {"id": parent_id, "data": {"NAME": name}})
+        except RuntimeError:
+            # Confirmed live (mini_app migration, 2026-08-01): two concurrent
+            # requests both seeing "doesn't exist yet" and both calling
+            # addsubfolder is a real race (e.g. a client tapping two
+            # different document-type uploads back to back, before their
+            # client folder exists) — Bitrix rejects the loser with
+            # DISK_OBJ_22000 ("folder already exists") instead of just
+            # returning the winner's folder. Re-check rather than raise: if
+            # someone else's concurrent call just won, use that folder.
+            existing = self._find_child_by_name(parent_id, name)
+            if existing:
+                return {"id": existing["ID"], "webViewLink": existing.get("DETAIL_URL")}
+            raise
+        created = result["result"]
+        return {"id": created["ID"], "webViewLink": created.get("DETAIL_URL")}
+
     def get_or_create_client_folder(self, full_name: str, phone: str) -> dict:
         self._ensure_clients_folder()
         # "|" avoided as a separator — some Disk backends reject it in
         # folder names even though Google Drive tolerates it fine.
         name = f"{_sanitize_name(full_name)} - {phone}"
-        existing = self._find_child_by_name(self._clients_folder_id, name)
-        if existing:
-            return {"id": existing["ID"], "webViewLink": existing.get("DETAIL_URL")}
-        result = bitrix._post("disk.folder.addsubfolder", {"id": self._clients_folder_id, "data": {"NAME": name}})
-        created = result["result"]
-        return {"id": created["ID"], "webViewLink": created.get("DETAIL_URL")}
+        return self._find_or_create(self._clients_folder_id, name)
 
     def get_or_create_folder(self, name: str, parent_id) -> dict:
-        existing = self._find_child_by_name(parent_id, name)
-        if existing:
-            return {"id": existing["ID"], "webViewLink": existing.get("DETAIL_URL")}
-        result = bitrix._post("disk.folder.addsubfolder", {"id": parent_id, "data": {"NAME": name}})
-        created = result["result"]
-        return {"id": created["ID"], "webViewLink": created.get("DETAIL_URL")}
+        return self._find_or_create(parent_id, name)
 
     def upload_bytes(self, data: bytes, filename: str, folder_id, mimetype: str = "application/octet-stream") -> dict:
         encoded = base64.b64encode(data).decode("ascii")
