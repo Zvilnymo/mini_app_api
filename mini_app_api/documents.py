@@ -152,20 +152,29 @@ def upload_document(conn, client: dict, document_type: str, filename: str, conte
         if result is not None:
             validation_status = result.status
 
-    db.log_document_upload_result(conn, client["id"], document_type, validation_status, duration_ms)
+    # Logged only after the file is actually on Disk and the row committed —
+    # logging before this point would record a false "success" in analytics
+    # for an upload that passed AI validation but then failed to save (e.g.
+    # a Bitrix Disk network error), with no docbot.documents row to show
+    # for it. A failure here still shows up as a bare document_upload_attempt
+    # with no matching result, which is the correct "stuck" signal.
+    try:
+        uploaded = disk.upload_bytes(content, filename, subfolder["id"], mimetype)
+        row = db.add_document(
+            conn,
+            client_id=client["id"],
+            document_type=document_type,
+            file_name=filename,
+            drive_file_id=uploaded["id"],
+            drive_file_url=uploaded.get("webViewLink"),
+            file_size=int(uploaded.get("size", len(content))),
+            validation_status=validation_status,
+        )
+    except Exception:
+        db.log_document_upload_result(conn, client["id"], document_type, "save_failed", duration_ms, len(content))
+        raise
 
-    uploaded = disk.upload_bytes(content, filename, subfolder["id"], mimetype)
-
-    row = db.add_document(
-        conn,
-        client_id=client["id"],
-        document_type=document_type,
-        file_name=filename,
-        drive_file_id=uploaded["id"],
-        drive_file_url=uploaded.get("webViewLink"),
-        file_size=int(uploaded.get("size", len(content))),
-        validation_status=validation_status,
-    )
+    db.log_document_upload_result(conn, client["id"], document_type, validation_status, duration_ms, row["file_size"])
 
     checklist = checklist_for_client(conn, client["id"])
     docs_ready = sum(1 for d in checklist if d["latest_status"] in ("accepted", "pending"))
@@ -206,27 +215,31 @@ def upload_text_document(conn, client: dict, document_type: str, text: str) -> d
     content = text.encode("utf-8")
 
     existing = db.get_latest_document(conn, client["id"], document_type)
-    if existing:
-        uploaded = disk.update_file(existing["drive_file_id"], filename, content)
-        row = db.update_document_file(
-            conn,
-            existing["id"],
-            drive_file_id=uploaded["id"],
-            drive_file_url=uploaded.get("webViewLink"),
-            file_size=int(uploaded.get("size", len(content))),
-        )
-    else:
-        subfolder = resolve_subfolder(disk, client, meta["folder"])
-        uploaded = disk.upload_bytes(content, filename, subfolder["id"], "text/plain")
-        row = db.add_document(
-            conn,
-            client_id=client["id"],
-            document_type=document_type,
-            file_name=filename,
-            drive_file_id=uploaded["id"],
-            drive_file_url=uploaded.get("webViewLink"),
-            file_size=int(uploaded.get("size", len(content))),
-            validation_status="pending",
-        )
-    db.log_document_upload_result(conn, client["id"], document_type, "pending", None)
+    try:
+        if existing:
+            uploaded = disk.update_file(existing["drive_file_id"], filename, content)
+            row = db.update_document_file(
+                conn,
+                existing["id"],
+                drive_file_id=uploaded["id"],
+                drive_file_url=uploaded.get("webViewLink"),
+                file_size=int(uploaded.get("size", len(content))),
+            )
+        else:
+            subfolder = resolve_subfolder(disk, client, meta["folder"])
+            uploaded = disk.upload_bytes(content, filename, subfolder["id"], "text/plain")
+            row = db.add_document(
+                conn,
+                client_id=client["id"],
+                document_type=document_type,
+                file_name=filename,
+                drive_file_id=uploaded["id"],
+                drive_file_url=uploaded.get("webViewLink"),
+                file_size=int(uploaded.get("size", len(content))),
+                validation_status="pending",
+            )
+    except Exception:
+        db.log_document_upload_result(conn, client["id"], document_type, "save_failed", None, len(content))
+        raise
+    db.log_document_upload_result(conn, client["id"], document_type, "pending", None, row["file_size"])
     return {"document": row, "validation_status": "pending"}

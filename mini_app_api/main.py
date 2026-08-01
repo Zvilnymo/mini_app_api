@@ -384,8 +384,10 @@ async def upload_payment_receipt(
         try:
             uploaded = payments.upload_receipt(client, invoice_id, invoice["title"] or "Рахунок", file.filename, content)
         except Exception as e:
+            db.log_document_upload_result(conn, client["id"], "payment_receipt", "save_failed", None, len(content))
             raise HTTPException(502, f"Не вдалося зберегти квитанцію: {e}")
 
+        db.log_document_upload_result(conn, client["id"], "payment_receipt", "accepted", None, len(content))
         db.mark_receipt_submitted(conn, invoice_id, client["id"])
 
         notifications.notify_admins(

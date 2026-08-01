@@ -1145,9 +1145,17 @@ def ensure_analytics_schema(conn) -> None:
                 document_type TEXT NOT NULL,
                 status TEXT NOT NULL,
                 duration_ms INT,
+                bytes_size INT,
                 resulted_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
+        )
+        # Table already existed in production before bytes_size was added —
+        # CREATE TABLE IF NOT EXISTS above is a no-op for it, so the column
+        # needs its own additive migration.
+        cur.execute(
+            "ALTER TABLE mini_app_analytics.document_upload_results "
+            "ADD COLUMN IF NOT EXISTS bytes_size INT"
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS doc_upload_results_client_idx "
@@ -1216,14 +1224,15 @@ def log_document_upload_attempt(conn, client_id: int, document_type: str, method
         conn.commit()
 
 
-def log_document_upload_result(conn, client_id: int, document_type: str, status: str, duration_ms: int | None):
+def log_document_upload_result(conn, client_id: int, document_type: str, status: str,
+                                duration_ms: int | None, bytes_size: int | None = None):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO mini_app_analytics.document_upload_results (client_id, document_type, status, duration_ms)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO mini_app_analytics.document_upload_results (client_id, document_type, status, duration_ms, bytes_size)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (client_id, document_type, status, duration_ms),
+            (client_id, document_type, status, duration_ms, bytes_size),
         )
         conn.commit()
 

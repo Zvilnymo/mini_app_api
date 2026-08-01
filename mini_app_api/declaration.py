@@ -149,10 +149,15 @@ def _compile_text(client: dict, answers: dict) -> str:
 
 def save_and_submit(conn, client: dict, answers: dict) -> None:
     db.save_declaration_answers(conn, client["id"], answers)
-    db.complete_declaration(conn, client["id"])
 
+    # Uploaded to Disk *before* marking completed — otherwise a Disk/network
+    # failure here would leave the DB saying "completed" (checklist shows
+    # done) with no actual file ever saved, since save_declaration_answers'
+    # own commit already happened and can't be rolled back after the fact.
     disk = get_disk()
     subfolder = resolve_subfolder(disk, client, "declaration")
     text = _compile_text(client, answers)
     filename = f"Анкета_{client['full_name']}.txt"
     disk.upload_bytes(text.encode("utf-8"), filename, subfolder["id"], "text/plain")
+
+    db.complete_declaration(conn, client["id"])
