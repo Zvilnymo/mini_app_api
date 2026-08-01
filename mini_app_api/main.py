@@ -111,6 +111,12 @@ def _refresh_faq_embeddings() -> None:
 def _start_scheduler():
     # Mirrors conf_bot's own in-process APScheduler (it has no separate
     # worker service either).
+    conn = db.get_connection()
+    try:
+        db.ensure_conferences_schema(conn)
+    finally:
+        conn.close()
+
     _refresh_faq_embeddings()  # populate the in-process cache before any chat request can arrive
 
     scheduler = BackgroundScheduler(timezone="UTC")
@@ -849,5 +855,118 @@ def admin_mark_attendance(
         _require_admin(conn, user, "conferences")
         db.mark_attendance(conn, event_id, client_id, attended)
         return {"ok": True}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Зустрічі — "Клієнти" admin section (ported from conf_bot's admin:clients:*
+# — filter clients by conference participation, view a profile with stats,
+# block/unblock from future conference invites).
+# ---------------------------------------------------------------------------
+
+def _serialize_client_row(row: dict) -> dict:
+    return {
+        "id": row["client_id"],
+        "full_name": row["full_name"],
+        "phone": row["phone"],
+        "telegram_id": row["telegram_id"],
+        "blocked": row["conference_broadcasts_blocked"],
+        "attended_count": row["attended_count"],
+    }
+
+
+@app.get("/api/admin/conferences/clients")
+def admin_list_clients(filter: str = "all", authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    if filter not in ("all", "completed", "active", "never"):
+        raise HTTPException(400, "filter must be one of: all, completed, active, never")
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        rows = db.list_clients_by_conference_filter(conn, filter)
+        return {"clients": [_serialize_client_row(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/admin/conferences/clients/{client_id}")
+def admin_get_client(client_id: int, authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        client = db.get_client_by_id(conn, client_id)
+        if not client:
+            raise HTTPException(404, "client not found")
+        stats = db.get_client_conference_stats(conn, client_id)
+        return {
+            "client": {
+                "id": client["id"],
+                "full_name": client["full_name"],
+                "phone": client["phone"],
+                "telegram_id": client["telegram_id"],
+                "blocked": client["conference_broadcasts_blocked"],
+            },
+            "stats": {
+                "attended_count": stats["attended_count"],
+                "attended_events": [{**e, "start_at": e["start_at"].isoformat()} for e in stats["attended_events"]],
+                "confirmed_count": stats["confirmed_count"],
+                "confirmed_events": [{**e, "start_at": e["start_at"].isoformat()} for e in stats["confirmed_events"]],
+                "attended_types": stats["attended_types"],
+                "total_types": stats["total_types"],
+                "completed_types": stats["completed_types"],
+            },
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/conferences/clients/{client_id}/block")
+def admin_block_client(client_id: int, authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        client = db.set_client_conference_blocked(conn, client_id, True)
+        if not client:
+            raise HTTPException(404, "client not found")
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/conferences/clients/{client_id}/unblock")
+def admin_unblock_client(client_id: int, authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        client = db.set_client_conference_blocked(conn, client_id, False)
+        if not client:
+            raise HTTPException(404, "client not found")
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Зустрічі — "Кастомна конференція" (ported from conf_bot's admin:custom /
+# CustomConfSG flow): same create_event + send_invites as the regular
+# "Нова зустріч" form, just resolves recipients by pasting phone numbers
+# (exact match) instead of the name/phone search picker.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/admin/conferences/clients/lookup-phones")
+def admin_lookup_phones(phones: list[str] = Body(..., embed=True), authorization: Optional[str] = Header(default=None)):
+    user = authenticate(authorization)
+    conn = db.get_connection()
+    try:
+        _require_admin(conn, user, "conferences")
+        matched, unmatched = db.lookup_clients_by_phones(conn, phones)
+        return {
+            "matched": [{"id": c["id"], "full_name": c["full_name"], "phone": c["phone"]} for c in matched],
+            "unmatched": unmatched,
+        }
     finally:
         conn.close()

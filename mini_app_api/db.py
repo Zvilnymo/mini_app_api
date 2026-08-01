@@ -786,6 +786,186 @@ def mark_reminded(conn, event_id: int, client_id: int, window: str):
         conn.commit()
 
 
+def ensure_conferences_schema(conn) -> None:
+    """Additive-only, safe to run on every startup (mirrors conf_bot's own
+    startup schema fixups). docbot.clients is shared with documents_bot, so
+    this column is deliberately conference-scoped by name rather than a
+    generic 'status'/'blocked' flag that other code might also read/write."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE docbot.clients ADD COLUMN IF NOT EXISTS "
+            "conference_broadcasts_blocked BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        conn.commit()
+
+
+def set_client_conference_blocked(conn, client_id: int, blocked: bool):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE docbot.clients SET conference_broadcasts_blocked = %s WHERE id = %s RETURNING *",
+            (blocked, client_id),
+        )
+        conn.commit()
+        return cur.fetchone()
+
+
+def get_client_conference_stats(conn, client_id: int) -> dict:
+    """Mirrors conf_bot's get_client_statistics."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM docbot.event_attendance WHERE client_id = %s AND attended",
+            (client_id,),
+        )
+        attended_count = cur.fetchone()["n"]
+
+        cur.execute(
+            """
+            SELECT e.event_id, e.title, e.start_at, e.type_code
+            FROM docbot.event_attendance a
+            JOIN docbot.events e ON e.event_id = a.event_id
+            WHERE a.client_id = %s AND a.attended
+            ORDER BY e.start_at DESC
+            """,
+            (client_id,),
+        )
+        attended_events = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM docbot.event_rsvp r
+            JOIN docbot.events e ON e.event_id = r.event_id
+            WHERE r.client_id = %s AND r.rsvp = 'going' AND e.start_at >= now()
+            """,
+            (client_id,),
+        )
+        confirmed_count = cur.fetchone()["n"]
+
+        cur.execute(
+            """
+            SELECT e.event_id, e.title, e.start_at, e.type_code
+            FROM docbot.event_rsvp r
+            JOIN docbot.events e ON e.event_id = r.event_id
+            WHERE r.client_id = %s AND r.rsvp = 'going' AND e.start_at >= now()
+            ORDER BY e.start_at
+            """,
+            (client_id,),
+        )
+        confirmed_events = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT DISTINCT t.type_code, t.title
+            FROM docbot.event_attendance a
+            JOIN docbot.events e ON e.event_id = a.event_id
+            JOIN docbot.event_types t ON t.type_code = e.type_code
+            WHERE a.client_id = %s AND a.attended
+            """,
+            (client_id,),
+        )
+        attended_types = cur.fetchall()
+
+        total_types = len(list_event_types(conn, active_only=True))
+
+        return {
+            "attended_count": attended_count or 0,
+            "attended_events": attended_events,
+            "confirmed_count": confirmed_count or 0,
+            "confirmed_events": confirmed_events,
+            "attended_types": attended_types,
+            "total_types": total_types,
+            "completed_types": len(attended_types),
+        }
+
+
+def list_clients_by_conference_filter(conn, filter_type: str):
+    """Ported from conf_bot's list_clients_by_filter — 'blocked' clients
+    (conference_broadcasts_blocked) are excluded from every filter, same as
+    conf_bot excluded status != 'active' from all four lists."""
+    with conn.cursor() as cur:
+        if filter_type == "all":
+            cur.execute(
+                """
+                SELECT c.id AS client_id, c.full_name, c.phone, c.telegram_id,
+                       c.conference_broadcasts_blocked,
+                       (SELECT COUNT(*) FROM docbot.event_attendance a
+                        WHERE a.client_id = c.id AND a.attended) AS attended_count
+                FROM docbot.clients c
+                WHERE NOT c.conference_broadcasts_blocked
+                ORDER BY c.last_activity DESC NULLS LAST
+                """
+            )
+        elif filter_type == "completed":
+            total_types = len(list_event_types(conn, active_only=True))
+            cur.execute(
+                """
+                SELECT c.id AS client_id, c.full_name, c.phone, c.telegram_id,
+                       c.conference_broadcasts_blocked,
+                       COUNT(*) AS attended_count
+                FROM docbot.clients c
+                JOIN docbot.event_attendance a ON a.client_id = c.id AND a.attended
+                JOIN docbot.events e ON e.event_id = a.event_id
+                WHERE NOT c.conference_broadcasts_blocked
+                GROUP BY c.id
+                HAVING COUNT(DISTINCT e.type_code) >= %s
+                ORDER BY c.last_activity DESC NULLS LAST
+                """,
+                (total_types,),
+            )
+        elif filter_type == "active":
+            cur.execute(
+                """
+                SELECT DISTINCT ON (c.id) c.id AS client_id, c.full_name, c.phone, c.telegram_id,
+                       c.conference_broadcasts_blocked,
+                       (SELECT COUNT(*) FROM docbot.event_attendance a
+                        WHERE a.client_id = c.id AND a.attended) AS attended_count
+                FROM docbot.clients c
+                JOIN docbot.event_rsvp r ON r.client_id = c.id
+                JOIN docbot.events e ON e.event_id = r.event_id
+                WHERE NOT c.conference_broadcasts_blocked
+                  AND r.rsvp = 'going' AND e.start_at >= now()
+                ORDER BY c.id, c.last_activity DESC NULLS LAST
+                """
+            )
+        elif filter_type == "never":
+            cur.execute(
+                """
+                SELECT c.id AS client_id, c.full_name, c.phone, c.telegram_id,
+                       c.conference_broadcasts_blocked, 0 AS attended_count
+                FROM docbot.clients c
+                WHERE NOT c.conference_broadcasts_blocked
+                  AND NOT EXISTS (
+                      SELECT 1 FROM docbot.event_attendance a
+                      WHERE a.client_id = c.id AND a.attended
+                  )
+                ORDER BY c.id DESC
+                """
+            )
+        else:
+            return []
+        return cur.fetchall()
+
+
+def lookup_clients_by_phones(conn, phones: list[str]):
+    """For 'Кастомна конференція' — exact phone match (not the fuzzy ILIKE
+    search_clients uses), mirroring conf_bot's custom_wait_phones. Returns
+    (matched_clients, unmatched_raw_inputs)."""
+    matched = []
+    matched_ids = set()
+    unmatched = []
+    for raw in phones:
+        phone = normalize_phone(raw)
+        if not phone:
+            unmatched.append(raw)
+            continue
+        client = get_client_by_phone(conn, phone)
+        if not client:
+            unmatched.append(raw)
+        elif client["id"] not in matched_ids:
+            matched_ids.add(client["id"])
+            matched.append(client)
+    return matched, unmatched
+
+
 # ---------------------------------------------------------------------------
 # docbot.faq_entries / chat_messages / chat_escalations — AI chat assistant.
 # faq_entries.embedding is a JSONB float array (text-embedding-3-small,
