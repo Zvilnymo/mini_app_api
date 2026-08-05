@@ -4,11 +4,11 @@ upload flow (docbot.documents rows), reusing ai_document_validator.py as-is
 (it's a clean, side-effect-free module — unlike telegram_bot.py, safe to
 import directly).
 
-Files are stored in Bitrix24 Disk (company common storage), not Google
-Drive — documents_bot's own Drive uploads are a separate, unrelated
-destination; docbot.clients.drive_folder_id/drive_folder_url stay
-Google-only and are never read or written here, to avoid mixing up a
-Google Drive folder ID with a Bitrix Disk one.
+Files are stored in Bitrix24 Disk (primary — docbot.documents.drive_file_id
+is always a Bitrix file id) AND, best-effort, duplicated to Google Drive per
+the 2026-08-02 customer requirement to keep both in sync — see dual_disk.py.
+docbot.clients.drive_folder_id/drive_folder_url stay documents_bot's own
+column (its Drive folder, populated by the bot, not by this API).
 """
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ from PIL import Image, UnidentifiedImageError
 from ai_document_validator import validator as ai_validator
 
 from . import db, notifications
-from .bitrix_disk import BitrixDiskManager, SUBFOLDERS
+from .bitrix_disk import SUBFOLDERS
+from .dual_disk import DualDiskManager
 
 # Phone camera photos routinely come in at 10-20+ MB. Base64-encoding the
 # original bytes for disk.folder.uploadfile then roughly triples the request
@@ -81,10 +82,10 @@ TEXT_TYPES = {k: v for k, v in DOCUMENT_TYPES.items() if v.get("is_text") or v.g
 _disk = None
 
 
-def get_disk() -> BitrixDiskManager:
+def get_disk() -> DualDiskManager:
     global _disk
     if _disk is None:
-        _disk = BitrixDiskManager()
+        _disk = DualDiskManager()
     return _disk
 
 
@@ -112,7 +113,7 @@ def checklist_for_client(conn, client_id: int | None) -> list[dict]:
     return items
 
 
-def resolve_subfolder(disk: BitrixDiskManager, client: dict, folder_key: str) -> dict:
+def resolve_subfolder(disk: DualDiskManager, client: dict, folder_key: str) -> dict:
     # Not cached on docbot.clients (that's documents_bot's Google Drive
     # folder id, a different system) — get_or_create_client_folder is
     # idempotent, so resolving it fresh each upload is simple and correct.
@@ -213,11 +214,16 @@ def upload_text_document(conn, client: dict, document_type: str, text: str) -> d
     disk = get_disk()
     filename = f"{meta['name']}.txt"
     content = text.encode("utf-8")
+    # Resolved up front (not only on the "new" branch) so the Drive-side
+    # folder id is available for update_file's dual-write even when
+    # overwriting an existing Bitrix file, which has no Drive file id of
+    # its own to update in place.
+    subfolder = resolve_subfolder(disk, client, meta["folder"])
 
     existing = db.get_latest_document(conn, client["id"], document_type)
     try:
         if existing:
-            uploaded = disk.update_file(existing["drive_file_id"], filename, content)
+            uploaded = disk.update_file(existing["drive_file_id"], filename, content, drive_folder_id=subfolder["id"])
             row = db.update_document_file(
                 conn,
                 existing["id"],
@@ -226,7 +232,6 @@ def upload_text_document(conn, client: dict, document_type: str, text: str) -> d
                 file_size=int(uploaded.get("size", len(content))),
             )
         else:
-            subfolder = resolve_subfolder(disk, client, meta["folder"])
             uploaded = disk.upload_bytes(content, filename, subfolder["id"], "text/plain")
             row = db.add_document(
                 conn,
